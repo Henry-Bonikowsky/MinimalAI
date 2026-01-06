@@ -1,0 +1,10 @@
+{
+  "key.minimalai.dashboard": "Open Dashboard",
+  "key.minimalai.record": "Toggle Recording",
+  "key.minimalai.playback": "Play/Pause Recording",
+  "key.minimalai.train": "Train on Recordings",
+  "key.minimalai.ai": "Run AI",
+  "key.minimalai.rl": "RL Training",
+  "key.minimalai.stop": "Stop All",
+  "key.category.minimalai": "MinimalAI"
+}

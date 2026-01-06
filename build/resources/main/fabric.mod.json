@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "minimalai",
+  "version": "1.0.0",
+  "name": "MinimalAI",
+  "description": "Minimal AI that learns to play Minecraft from your recordings",
+  "authors": ["henry"],
+  "contact": {},
+  "license": "MIT",
+  "icon": "assets/minimalai/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.minimalai.MinimalAI"]
+  },
+  "mixins": ["minimalai.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.8",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
