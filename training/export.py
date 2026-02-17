@@ -48,11 +48,11 @@ def export_model(checkpoint_path: str, output_path: str):
     wrapper.eval()
 
     # v2 dimensions
-    entity_mask = torch.zeros(1, 32)
+    entity_mask = torch.zeros(1, 8)
     entity_mask[0, 0] = 1.0
     example = (
         torch.randn(1, 38),         # self_state
-        torch.randn(1, 32, 24),     # entity_features
+        torch.randn(1, 8, 24),      # entity_features
         entity_mask,                 # entity_mask
         torch.randn(1, 26),         # combat_ctx
         torch.randn(1, 48),         # sigil_state

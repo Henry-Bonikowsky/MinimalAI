@@ -1,0 +1,29 @@
+name: MinimalAI
+version: '${version}'
+main: com.minimalai.MinimalAIPlugin
+api-version: '1.21'
+description: AI combat bots with live RL training via DJL inference
+softdepend:
+  - ArcaneSigils
+
+commands:
+  bot:
+    description: Manage AI combat bots
+    usage: /bot <spawn|despawn|list> [name]
+    permission: minimalai.bot
+  maitrain:
+    description: Control RL training
+    usage: /maitrain <start|stop|status>
+    permission: minimalai.train
+  maimodel:
+    description: Manage AI models
+    usage: /maimodel <load|list> [name]
+    permission: minimalai.model
+
+permissions:
+  minimalai.bot:
+    default: op
+  minimalai.train:
+    default: op
+  minimalai.model:
+    default: op

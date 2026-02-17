@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Java
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Runtime
+run/
+server/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Session files
+session-state.md
+scratch/

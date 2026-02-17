@@ -1,0 +1,32 @@
+# MinimalAI Configuration
+
+# Model settings
+model:
+  directory: "models"
+  default: "master"
+
+# Bot settings
+bot:
+  tick-rate: 1
+  max-bots: 8
+
+# Arena center for env_state observations
+arena:
+  center-x: 0.0
+  center-y: 64.0
+  center-z: 0.0
+
+# Training settings
+training:
+  enabled: false
+  server-host: "localhost"
+  server-port: 9876
+  batch-size: 2048
+  episode-length: 600
+
+# Reward tuning
+rewards:
+  kill: 5.0
+  death: -3.0
+  damage-dealt-scale: 0.5
+  damage-taken-scale: -0.1
