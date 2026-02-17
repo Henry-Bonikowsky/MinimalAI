@@ -54,7 +54,7 @@ ACT_TARGET_0 = 30
 ACT_TARGET_4 = 34
 
 NUM_ACTIONS = 35
-MAX_ENTITIES = 32
+MAX_ENTITIES = 8
 SELF_STATE_DIM = 38
 ENTITY_FEATURE_DIM = 24
 COMBAT_CTX_DIM = 26
@@ -123,6 +123,8 @@ class CombatEnv(gym.Env):
         self._prev_health_diff = 0.0
         self._prev_dist_to_target = 0.0
         self._prev_facing_target = 0.0
+        self._last_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        self._sigils_activated_this_tick = []
 
         # Sorted entities for target selection (updated each tick)
         self._sorted_enemies: list[Agent] = []
@@ -198,6 +200,8 @@ class CombatEnv(gym.Env):
         self._prev_health_diff = 0.0
         self._prev_dist_to_target = ARENA_SIZE
         self._prev_facing_target = 0.0
+        self._last_action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        self._sigils_activated_this_tick = []
         self._opponent_actions = {}
         self._update_sorted_enemies()
 
@@ -226,6 +230,7 @@ class CombatEnv(gym.Env):
 
         # Apply action masking
         action = self._apply_action_mask(action)
+        self._last_action = action.copy()
 
         # Execute player actions
         self._execute_actions(self.player, action)
@@ -319,6 +324,21 @@ class CombatEnv(gym.Env):
         if action[ACT_STRAFE_LEFT] and action[ACT_STRAFE_RIGHT]:
             action[ACT_STRAFE_RIGHT] = 0
 
+        # Weapon swap disabled - all abilities work on sword
+        action[ACT_SWAP_WEAPON] = 0
+
+        # Eating lock-in: once eating starts, can't cancel, can't attack/sprint
+        if agent.kit.is_eating:
+            action[ACT_EAT_GAP] = 0
+            action[ACT_ATTACK] = 0
+            action[ACT_SPRINT] = 0
+            action[ACT_SPRINT_RESET] = 0
+            action[ACT_BLOCK] = 0
+            action[ACT_THROW_POT] = 0
+            action[ACT_THROW_PEARL] = 0
+            for i in range(NUM_SIGIL_SLOTS):
+                action[ACT_SIGIL_0 + i] = 0
+
         # Kit masking
         if agent.kit.golden_apples <= 0 or agent.kit.is_eating:
             action[ACT_EAT_GAP] = 0
@@ -330,10 +350,6 @@ class CombatEnv(gym.Env):
         # Sprint reset only if sprinting
         if not agent.is_sprinting:
             action[ACT_SPRINT_RESET] = 0
-
-        # Block only works with sword
-        if agent.weapon != WeaponType.SWORD:
-            action[ACT_BLOCK] = 0
 
         # Sigil masking
         sigil_mask = self.physics.sigil_engine.get_ability_mask(agent)
@@ -369,12 +385,8 @@ class CombatEnv(gym.Env):
             # Re-sprint immediately
             agent.is_sprinting = True
 
-        # Swap weapon
-        if action[ACT_SWAP_WEAPON]:
-            if agent.weapon == WeaponType.SWORD:
-                agent.weapon = WeaponType.AXE
-            else:
-                agent.weapon = WeaponType.SWORD
+        # Swap weapon disabled - always sword
+        # (all abilities work regardless of weapon)
 
         # Movement
         forward = 0.0
@@ -413,12 +425,10 @@ class CombatEnv(gym.Env):
         # 1.8 blockhit: BLOCK + ATTACK = both active simultaneously
         agent.is_blocking = bool(action[ACT_BLOCK])
 
-        # Eating
+        # Eating (committed - once started, must finish the full 32 ticks)
         if action[ACT_EAT_GAP]:
             self.physics.start_eating(agent)
             logger.debug(f"t={self.current_tick} | Agent {agent.agent_id} started eating gap")
-        elif agent.kit.is_eating and action[ACT_ATTACK]:
-            self.physics.cancel_eating(agent)
 
         # Health pot
         if action[ACT_THROW_POT]:
@@ -438,11 +448,16 @@ class CombatEnv(gym.Env):
 
         # Sigil activations
         all_agents = [self.player] + self._all_entities
+        sigils_activated = []
         for i in range(NUM_SIGIL_SLOTS):
             if action[ACT_SIGIL_0 + i]:
-                self.physics.sigil_engine.activate_ability(
+                success = self.physics.sigil_engine.activate_ability(
                     agent, i, all_agents, self.current_tick
                 )
+                if success:
+                    sigils_activated.append(i)
+        if agent is self.player:
+            self._sigils_activated_this_tick = sigils_activated
 
     def _get_target_for(self, agent: Agent) -> Agent | None:
         """Get an agent's current target."""
@@ -542,43 +557,88 @@ class CombatEnv(gym.Env):
         """Calculate reward for the current tick.
 
         Reward design:
-        - Strong positive for kills (+5.0)
-        - Moderate negative for dying (-3.0)
-        - Dense reward for dealing damage (encourages aggression)
-        - Small penalty for taking damage (doesn't discourage engagement)
-        - Potential-based shaping for approach + health advantage
+        - Sparse: kill (+5), death (-3)
+        - Dense: damage dealt/taken
+        - Action quality: penalize whiffs, wasted pots, reward smart ability use
+        - Potential shaping: approach + health advantage
         """
         reward = 0.0
         player = self.player
+        action = self._last_action
+        target = self._get_target_for(player)
 
-        # Sparse: kill (strong positive signal)
+        # ── Sparse events ──
         if player.damage_dealt_this_tick > 0:
             for enemy in self.enemies:
                 if not enemy.is_alive and enemy.last_hurt_tick == self.current_tick:
                     reward += 5.0
 
-        # Sparse: death
         if not player.is_alive:
             reward -= 3.0
 
-        # Dense: damage dealt (strong - encourage aggression)
+        # ── Dense: damage dealt/taken ──
         reward += (player.damage_dealt_this_tick / MAX_HEALTH) * 0.5
-
-        # Dense: damage taken (weak - don't discourage engagement)
         reward -= (player.damage_taken_this_tick / MAX_HEALTH) * 0.1
 
-        # Potential-based shaping
-        target = self._get_target_for(player)
+        # ── Action quality: attack timing ──
+        if action[ACT_ATTACK] and target is not None and target.is_alive:
+            dist = self.physics.distance_between(player, target)
+            # Whiff: swinging out of reach
+            if dist > 3.5:
+                reward -= 0.05
+            # Wasted hit: target has hurt immunity (i-frames)
+            elif target.hurt_immune_ticks > 0:
+                reward -= 0.03
+
+        # ── Action quality: pot timing ──
+        if action[ACT_THROW_POT]:
+            if player.health > 15.0:  # > 75% HP = wasteful
+                reward -= 0.3
+            elif player.health < 10.0:  # < 50% HP = smart
+                reward += 0.2
+
+        # ── Action quality: sigil usage ──
+        for slot_idx in self._sigils_activated_this_tick:
+            slot = player.sigil_slots[slot_idx]
+            has_nearby_enemy = False
+            if target is not None and target.is_alive:
+                dist_to_target = self.physics.distance_between(player, target)
+                has_nearby_enemy = dist_to_target < 8.0
+
+            # Defensive abilities (bolster, quicksand, niles_grace, kings_brace burst)
+            if slot.sigil_type in ("royal_bolster", "niles_grace"):
+                if player.health < 10.0:  # used when actually hurt
+                    reward += 0.3
+                elif player.health > 18.0:  # wasted at full HP
+                    reward -= 0.1
+            elif slot.sigil_type == "quick_sand":
+                if has_nearby_enemy:
+                    reward += 0.2  # good: enemies nearby to slow
+                else:
+                    reward -= 0.1  # wasted: nobody to affect
+            # Offensive abilities (cleopatra, royal_guard)
+            elif slot.sigil_type in ("cleopatra", "royal_guard"):
+                if has_nearby_enemy:
+                    reward += 0.2
+                else:
+                    reward -= 0.1
+            elif slot.sigil_type == "kings_brace":
+                reward += 0.2  # burst is always situationally good (requires 100 charges)
+
+        # ── Opportunity cost: not using defensive sigils when hurt ──
+        if player.health < 6.0:  # < 30% HP
+            for slot in player.sigil_slots:
+                if (slot.equipped and slot.cooldown_remaining == 0 and
+                        slot.sigil_type in ("royal_bolster", "niles_grace") and
+                        "ability" in slot.activation_type):
+                    reward -= 0.02  # accumulates per tick until they use it
+
+        # ── Potential-based shaping ──
         if target is not None and target.is_alive:
             dist = self.physics.distance_between(player, target)
-
-            # Distance potential: closer is better (smooth, not binary)
             dist_potential = max(0.0, 1.0 - dist / ARENA_SIZE)
-
-            # In-range bonus
             in_range = 1.0 if 2.0 <= dist <= 3.5 else 0.0
 
-            # Facing target
             dx = target.x - player.x
             dz = target.z - player.z
             angle_to = np.arctan2(dz, dx)
@@ -586,7 +646,6 @@ class CombatEnv(gym.Env):
             angle_diff = min(angle_diff, 2 * np.pi - angle_diff)
             facing = 1.0 if angle_diff < np.pi / 6 else 0.0
 
-            # Health advantage
             health_diff = (player.health - target.health) / MAX_HEALTH
 
             phi_current = (
@@ -760,8 +819,25 @@ class CombatEnv(gym.Env):
             agent = self.player
         mask = np.ones(NUM_ACTIONS, dtype=np.float32)
 
+        # Weapon swap always disabled
+        mask[ACT_SWAP_WEAPON] = 0.0
+
+        # Eating lock-in: while eating, most actions masked
+        if agent.kit.is_eating:
+            mask[ACT_EAT_GAP] = 0.0
+            mask[ACT_ATTACK] = 0.0
+            mask[ACT_SPRINT] = 0.0
+            mask[ACT_SPRINT_RESET] = 0.0
+            mask[ACT_BLOCK] = 0.0
+            mask[ACT_THROW_POT] = 0.0
+            mask[ACT_THROW_PEARL] = 0.0
+            for i in range(NUM_SIGIL_SLOTS):
+                mask[ACT_SIGIL_0 + i] = 0.0
+            # Can still move (slowly) and look, but that's it
+            return mask
+
         # Kit masking
-        if agent.kit.golden_apples <= 0 or agent.kit.is_eating:
+        if agent.kit.golden_apples <= 0:
             mask[ACT_EAT_GAP] = 0.0
         if agent.kit.health_pots <= 0 or agent.kit.pot_cooldown > 0:
             mask[ACT_THROW_POT] = 0.0
@@ -771,10 +847,6 @@ class CombatEnv(gym.Env):
         # Sprint reset only if sprinting
         if not agent.is_sprinting:
             mask[ACT_SPRINT_RESET] = 0.0
-
-        # Block only with sword
-        if agent.weapon != WeaponType.SWORD:
-            mask[ACT_BLOCK] = 0.0
 
         # Sigil masking
         sigil_mask = self.physics.sigil_engine.get_ability_mask(agent)

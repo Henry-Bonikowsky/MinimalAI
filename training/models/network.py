@@ -1,7 +1,7 @@
 """Neural network with entity attention for combat AI (v2).
 
 Architecture:
-  Per-Entity Features (up to 32 x 24)
+  Per-Entity Features (up to 8 x 24)
     -> Entity Encoder: Linear(24, 64) + ReLU (shared weights)
     -> 2-Head Self-Attention (64 dim, 2 layers)
     -> Mean Pool over valid entities -> 64-dim entity summary
@@ -27,7 +27,7 @@ COMBAT_CTX_DIM = 26
 SIGIL_STATE_DIM = 48   # 12 slots * 4 dims
 ENV_STATE_DIM = 8
 NUM_ACTIONS = 35
-MAX_ENTITIES = 32
+MAX_ENTITIES = 8
 
 ENTITY_EMBED_DIM = 64
 ATTENTION_HEADS = 2

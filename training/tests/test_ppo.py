@@ -5,7 +5,7 @@ import torch
 import pytest
 import os
 import tempfile
-from combat_sim.env import CombatEnv
+from combat_sim.env import CombatEnv, MAX_ENTITIES, ENTITY_FEATURE_DIM
 from models.network import CombatNetwork, SELF_STATE_DIM, COMBAT_CTX_DIM, SIGIL_STATE_DIM, ENV_STATE_DIM, NUM_ACTIONS, GRU_HIDDEN_DIM
 from models.ppo import PPO, RolloutBuffer
 
@@ -33,69 +33,51 @@ def ppo(env):
     )
 
 
+OBS_SHAPES = {
+    "self_state": (SELF_STATE_DIM,),
+    "entity_features": (MAX_ENTITIES, ENTITY_FEATURE_DIM),
+    "entity_mask": (MAX_ENTITIES,),
+    "combat_ctx": (COMBAT_CTX_DIM,),
+    "sigil_state": (SIGIL_STATE_DIM,),
+    "env_state": (ENV_STATE_DIM,),
+}
+
+
+def _make_obs():
+    return {k: np.zeros(v, dtype=np.float32) for k, v in OBS_SHAPES.items()}
+
+
 class TestRolloutBuffer:
     def test_add_and_length(self):
-        buf = RolloutBuffer()
-        obs = {
-            "self_state": np.zeros(SELF_STATE_DIM),
-            "entity_features": np.zeros((32, 24)),
-            "entity_mask": np.zeros(32),
-            "combat_ctx": np.zeros(COMBAT_CTX_DIM),
-            "sigil_state": np.zeros(SIGIL_STATE_DIM),
-            "env_state": np.zeros(ENV_STATE_DIM),
-        }
-        buf.add(obs, np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), 0.0, 1.0, 0.5, False, np.zeros((1, 1, GRU_HIDDEN_DIM)))
+        buf = RolloutBuffer(capacity=64, obs_shapes=OBS_SHAPES)
+        buf.add(_make_obs(), np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), 0.0, 1.0, 0.5, False, None)
         assert len(buf) == 1
 
     def test_clear(self):
-        buf = RolloutBuffer()
-        obs = {
-            "self_state": np.zeros(SELF_STATE_DIM),
-            "entity_features": np.zeros((32, 24)),
-            "entity_mask": np.zeros(32),
-            "combat_ctx": np.zeros(COMBAT_CTX_DIM),
-            "sigil_state": np.zeros(SIGIL_STATE_DIM),
-            "env_state": np.zeros(ENV_STATE_DIM),
-        }
-        buf.add(obs, np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), 0.0, 1.0, 0.5, False, np.zeros((1, 1, GRU_HIDDEN_DIM)))
+        buf = RolloutBuffer(capacity=64, obs_shapes=OBS_SHAPES)
+        buf.add(_make_obs(), np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), 0.0, 1.0, 0.5, False, None)
         buf.clear()
         assert len(buf) == 0
 
     def test_gae_computation(self):
-        buf = RolloutBuffer()
-        obs = {
-            "self_state": np.zeros(SELF_STATE_DIM),
-            "entity_features": np.zeros((32, 24)),
-            "entity_mask": np.zeros(32),
-            "combat_ctx": np.zeros(COMBAT_CTX_DIM),
-            "sigil_state": np.zeros(SIGIL_STATE_DIM),
-            "env_state": np.zeros(ENV_STATE_DIM),
-        }
+        buf = RolloutBuffer(capacity=64, obs_shapes=OBS_SHAPES)
         for i in range(10):
-            buf.add(obs, np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), -0.5, 0.1 * i, 0.5, i == 9, np.zeros((1, 1, GRU_HIDDEN_DIM)))
+            buf.add(_make_obs(), np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), -0.5, 0.1 * i, 0.5, i == 9, None)
 
         buf.compute_gae(last_value=0.0, gamma=0.99, gae_lambda=0.95)
         assert buf.advantages is not None
         assert buf.returns is not None
-        assert len(buf.advantages) == 10
-        assert not np.isnan(buf.advantages).any()
+        assert len(buf) == 10
+        assert not np.isnan(buf.advantages[:10]).any()
 
     def test_gae_terminal_episode(self):
-        buf = RolloutBuffer()
-        obs = {
-            "self_state": np.zeros(SELF_STATE_DIM),
-            "entity_features": np.zeros((32, 24)),
-            "entity_mask": np.zeros(32),
-            "combat_ctx": np.zeros(COMBAT_CTX_DIM),
-            "sigil_state": np.zeros(SIGIL_STATE_DIM),
-            "env_state": np.zeros(ENV_STATE_DIM),
-        }
+        buf = RolloutBuffer(capacity=64, obs_shapes=OBS_SHAPES)
         for i in range(10):
             done = (i == 4)
-            buf.add(obs, np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), -0.5, 0.1, 0.5, done, np.zeros((1, 1, GRU_HIDDEN_DIM)))
+            buf.add(_make_obs(), np.zeros(NUM_ACTIONS), np.ones(NUM_ACTIONS), -0.5, 0.1, 0.5, done, None)
 
         buf.compute_gae(last_value=0.3, gamma=0.99, gae_lambda=0.95)
-        assert not np.isnan(buf.advantages).any()
+        assert not np.isnan(buf.advantages[:10]).any()
 
 
 class TestPPO:

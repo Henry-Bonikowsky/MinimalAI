@@ -16,99 +16,92 @@ from dataclasses import dataclass, field
 from .network import CombatNetwork, NUM_ACTIONS, GRU_HIDDEN_DIM
 
 
-@dataclass
 class RolloutBuffer:
-    """Stores a batch of rollout data for PPO training."""
-    obs_self_state: list = field(default_factory=list)
-    obs_entity_features: list = field(default_factory=list)
-    obs_entity_mask: list = field(default_factory=list)
-    obs_combat_ctx: list = field(default_factory=list)
-    obs_sigil_state: list = field(default_factory=list)
-    obs_env_state: list = field(default_factory=list)
-    actions: list = field(default_factory=list)
-    action_masks: list = field(default_factory=list)
-    log_probs: list = field(default_factory=list)
-    rewards: list = field(default_factory=list)
-    values: list = field(default_factory=list)
-    dones: list = field(default_factory=list)
-    hiddens: list = field(default_factory=list)
+    """Pre-allocated rollout buffer for PPO training.
 
-    # Computed after rollout
-    advantages: np.ndarray = None
-    returns: np.ndarray = None
+    Uses fixed numpy arrays instead of Python lists to avoid memory
+    fragmentation and the triple-copy (list → np.array → torch.tensor).
+    """
+
+    def __init__(self, capacity: int, obs_shapes: dict):
+        self.capacity = capacity
+        self.pos = 0
+
+        # Pre-allocate observation arrays
+        self.obs_self_state = np.zeros((capacity, *obs_shapes["self_state"]), dtype=np.float32)
+        self.obs_entity_features = np.zeros((capacity, *obs_shapes["entity_features"]), dtype=np.float32)
+        self.obs_entity_mask = np.zeros((capacity, *obs_shapes["entity_mask"]), dtype=np.float32)
+        self.obs_combat_ctx = np.zeros((capacity, *obs_shapes["combat_ctx"]), dtype=np.float32)
+        self.obs_sigil_state = np.zeros((capacity, *obs_shapes["sigil_state"]), dtype=np.float32)
+        self.obs_env_state = np.zeros((capacity, *obs_shapes["env_state"]), dtype=np.float32)
+
+        self.actions = np.zeros((capacity, NUM_ACTIONS), dtype=np.float32)
+        self.action_masks = np.zeros((capacity, NUM_ACTIONS), dtype=np.float32)
+        self.log_probs = np.zeros(capacity, dtype=np.float32)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.values = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+
+        self.advantages = np.zeros(capacity, dtype=np.float32)
+        self.returns = np.zeros(capacity, dtype=np.float32)
 
     def add(self, obs: dict, action, action_mask, log_prob, reward, value, done, hidden):
-        self.obs_self_state.append(obs["self_state"])
-        self.obs_entity_features.append(obs["entity_features"])
-        self.obs_entity_mask.append(obs["entity_mask"])
-        self.obs_combat_ctx.append(obs["combat_ctx"])
-        self.obs_sigil_state.append(obs["sigil_state"])
-        self.obs_env_state.append(obs["env_state"])
-        self.actions.append(action)
-        self.action_masks.append(action_mask)
-        self.log_probs.append(log_prob)
-        self.rewards.append(reward)
-        self.values.append(value)
-        self.dones.append(done)
-        self.hiddens.append(hidden)
+        i = self.pos
+        self.obs_self_state[i] = obs["self_state"]
+        self.obs_entity_features[i] = obs["entity_features"]
+        self.obs_entity_mask[i] = obs["entity_mask"]
+        self.obs_combat_ctx[i] = obs["combat_ctx"]
+        self.obs_sigil_state[i] = obs["sigil_state"]
+        self.obs_env_state[i] = obs["env_state"]
+        self.actions[i] = action
+        self.action_masks[i] = action_mask
+        self.log_probs[i] = log_prob
+        self.rewards[i] = reward
+        self.values[i] = value
+        self.dones[i] = float(done)
+        self.pos += 1
 
     def clear(self):
-        for attr in [
-            'obs_self_state', 'obs_entity_features', 'obs_entity_mask',
-            'obs_combat_ctx', 'obs_sigil_state', 'obs_env_state',
-            'actions', 'action_masks', 'log_probs', 'rewards', 'values',
-            'dones', 'hiddens',
-        ]:
-            getattr(self, attr).clear()
-        self.advantages = None
-        self.returns = None
+        self.pos = 0
 
     def __len__(self):
-        return len(self.rewards)
+        return self.pos
 
     def compute_gae(self, last_value: float, gamma: float = 0.99, gae_lambda: float = 0.95):
         """Compute Generalized Advantage Estimation."""
-        rewards = np.array(self.rewards, dtype=np.float32)
-        values = np.array(self.values, dtype=np.float32)
-        dones = np.array(self.dones, dtype=np.float32)
-
-        n = len(rewards)
-        advantages = np.zeros(n, dtype=np.float32)
+        n = self.pos
         last_gae = 0.0
 
         for t in reversed(range(n)):
             if t == n - 1:
                 next_value = last_value
-                next_non_terminal = 1.0 - dones[t]
             else:
-                next_value = values[t + 1]
-                next_non_terminal = 1.0 - dones[t]
+                next_value = self.values[t + 1]
+            next_non_terminal = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
+            self.advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
 
-            delta = rewards[t] + gamma * next_value * next_non_terminal - values[t]
-            advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
-
-        self.advantages = advantages
-        self.returns = advantages + values
+        self.returns[:n] = self.advantages[:n] + self.values[:n]
 
     def get_batches(self, batch_size: int, device: torch.device):
-        """Yield minibatches for training."""
-        n = len(self.rewards)
+        """Yield minibatches for training. Zero-copy from numpy to torch."""
+        n = self.pos
         indices = np.random.permutation(n)
 
-        # Convert all data to tensors
+        # Convert pre-allocated arrays directly to tensors (no intermediate copy)
         all_obs = {
-            "self_state": torch.tensor(np.array(self.obs_self_state), dtype=torch.float32, device=device),
-            "entity_features": torch.tensor(np.array(self.obs_entity_features), dtype=torch.float32, device=device),
-            "entity_mask": torch.tensor(np.array(self.obs_entity_mask), dtype=torch.float32, device=device),
-            "combat_ctx": torch.tensor(np.array(self.obs_combat_ctx), dtype=torch.float32, device=device),
-            "sigil_state": torch.tensor(np.array(self.obs_sigil_state), dtype=torch.float32, device=device),
-            "env_state": torch.tensor(np.array(self.obs_env_state), dtype=torch.float32, device=device),
+            "self_state": torch.from_numpy(self.obs_self_state[:n]).to(device),
+            "entity_features": torch.from_numpy(self.obs_entity_features[:n]).to(device),
+            "entity_mask": torch.from_numpy(self.obs_entity_mask[:n]).to(device),
+            "combat_ctx": torch.from_numpy(self.obs_combat_ctx[:n]).to(device),
+            "sigil_state": torch.from_numpy(self.obs_sigil_state[:n]).to(device),
+            "env_state": torch.from_numpy(self.obs_env_state[:n]).to(device),
         }
-        all_actions = torch.tensor(np.array(self.actions), dtype=torch.float32, device=device)
-        all_action_masks = torch.tensor(np.array(self.action_masks), dtype=torch.float32, device=device)
-        all_log_probs = torch.tensor(np.array(self.log_probs), dtype=torch.float32, device=device)
-        all_advantages = torch.tensor(self.advantages, dtype=torch.float32, device=device)
-        all_returns = torch.tensor(self.returns, dtype=torch.float32, device=device)
+        all_actions = torch.from_numpy(self.actions[:n]).to(device)
+        all_action_masks = torch.from_numpy(self.action_masks[:n]).to(device)
+        all_log_probs = torch.from_numpy(self.log_probs[:n]).to(device)
+        all_advantages = torch.from_numpy(self.advantages[:n]).to(device)
+        all_returns = torch.from_numpy(self.returns[:n]).to(device)
 
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
@@ -157,7 +150,7 @@ class PPO:
         self.target_kl = target_kl
 
         self.optimizer = optim.Adam(network.parameters(), lr=lr, eps=1e-5)
-        self.buffer = RolloutBuffer()
+        self.buffer = None  # created lazily in collect_rollout
 
         # Training stats
         self.total_steps = 0
@@ -170,10 +163,15 @@ class PPO:
         Returns:
             dict with episode stats (rewards, lengths, etc.)
         """
-        self.buffer.clear()
         self.network.eval()
 
         obs, info = env.reset()
+
+        # Lazily create buffer with correct observation shapes
+        if self.buffer is None:
+            obs_shapes = {k: v.shape for k, v in obs.items()}
+            self.buffer = RolloutBuffer(num_steps, obs_shapes)
+        self.buffer.clear()
         hidden = self.network.init_hidden(batch_size=1).to(self.device)
         action_mask = env.get_action_mask()
 
@@ -212,7 +210,7 @@ class PPO:
                 reward=reward,
                 value=value_val,
                 done=done,
-                hidden=hidden.detach().cpu().numpy(),
+                hidden=None,
             )
 
             current_ep_reward += reward

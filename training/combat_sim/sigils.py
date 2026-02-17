@@ -193,8 +193,7 @@ class SigilEngine:
                     result["effects"].append("sandstorm_applied")
 
             # Ruler's Hand: bonus damage if target has Pharaoh's Mark
-            if (slot.sigil_type == "rulers_hand" and
-                    attacker.weapon == 1):  # SWORD
+            if slot.sigil_type == "rulers_hand":
                 defn = SIGIL_DEFS["rulers_hand"]
                 chance = _tier_scale(defn["base_chance"], slot.tier)
                 if (attacker.agent_id in target.pharaoh_marks and

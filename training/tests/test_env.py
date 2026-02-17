@@ -118,22 +118,35 @@ class TestActions:
             if terminated or truncated:
                 break
 
-    def test_swap_weapon(self, env_1v1):
-        """SWAP_WEAPON should toggle sword <-> axe."""
+    def test_swap_weapon_disabled(self, env_1v1):
+        """SWAP_WEAPON should be disabled (all abilities work on sword)."""
         env_1v1.reset()
         assert env_1v1.player.weapon == WeaponType.SWORD
         action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         action[ACT_SWAP_WEAPON] = 1
         env_1v1.step(action)
-        assert env_1v1.player.weapon == WeaponType.AXE
+        assert env_1v1.player.weapon == WeaponType.SWORD  # stays sword
 
     def test_eat_gap_action(self, env_1v1):
-        """EAT_GAP should start eating."""
+        """EAT_GAP should start eating and lock player in."""
         env_1v1.reset()
         action = np.zeros(NUM_ACTIONS, dtype=np.int8)
         action[ACT_EAT_GAP] = 1
         env_1v1.step(action)
         assert env_1v1.player.kit.is_eating
+
+    def test_eating_locks_out_attack(self, env_1v1):
+        """While eating, ATK should be masked out (committed eat)."""
+        env_1v1.reset()
+        action = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        action[ACT_EAT_GAP] = 1
+        env_1v1.step(action)
+        assert env_1v1.player.kit.is_eating
+        # Try to attack while eating - should still be eating
+        action2 = np.zeros(NUM_ACTIONS, dtype=np.int8)
+        action2[ACT_ATTACK] = 1
+        env_1v1.step(action2)
+        assert env_1v1.player.kit.is_eating  # eating not cancelled
 
     def test_throw_pot_action(self, env_1v1):
         """THROW_POT should heal player."""
@@ -270,11 +283,20 @@ class TestActionMask:
         mask = env_1v1.get_action_mask()
         assert mask[ACT_SPRINT_RESET] == 0.0
 
-    def test_block_masked_when_holding_axe(self, env_1v1):
+    def test_swap_weapon_always_masked(self, env_1v1):
         env_1v1.reset()
-        env_1v1.player.weapon = WeaponType.AXE
         mask = env_1v1.get_action_mask()
+        assert mask[ACT_SWAP_WEAPON] == 0.0
+
+    def test_eating_masks_attack_and_sprint(self, env_1v1):
+        env_1v1.reset()
+        env_1v1.player.kit.is_eating = True
+        env_1v1.player.kit.eating_ticks = 16
+        mask = env_1v1.get_action_mask()
+        assert mask[ACT_ATTACK] == 0.0
+        assert mask[ACT_SPRINT] == 0.0
         assert mask[ACT_BLOCK] == 0.0
+        assert mask[ACT_EAT_GAP] == 0.0  # can't start another eat
 
 
 class TestSigils:

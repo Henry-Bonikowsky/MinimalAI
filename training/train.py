@@ -283,11 +283,17 @@ def collect_rollout_selfplay(ppo: PPO, env: CombatEnv, num_steps: int,
                              device: str = "cpu",
                              log_episodes: int = 0) -> dict:
     """Collect rollout with self-play opponent support."""
-    ppo.buffer.clear()
     ppo.network.eval()
     device_t = torch.device(device)
 
     obs, info = env.reset()
+
+    # Lazily create buffer with correct observation shapes
+    if ppo.buffer is None:
+        from models.ppo import RolloutBuffer
+        obs_shapes = {k: v.shape for k, v in obs.items()}
+        ppo.buffer = RolloutBuffer(num_steps, obs_shapes)
+    ppo.buffer.clear()
     hidden = ppo.network.init_hidden(batch_size=1).to(device_t)
     action_mask = env.get_action_mask()
 
