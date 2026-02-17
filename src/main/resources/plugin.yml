@@ -9,7 +9,7 @@ softdepend:
 commands:
   bot:
     description: Manage AI combat bots
-    usage: /bot <spawn|despawn|list> [name]
+    usage: /bot <spawn|despawn|list|savekit|deletekit|kits> [args]
     permission: minimalai.bot
   maitrain:
     description: Control RL training

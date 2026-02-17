@@ -4,6 +4,7 @@ import com.minimalai.ai.*;
 import com.minimalai.bot.BotBrain;
 import com.minimalai.bot.FakePlayerManager;
 import com.minimalai.bot.FakePlayerManager.BotContext;
+import com.minimalai.bot.KitManager;
 import com.minimalai.integration.ArcaneSigilsAPI;
 import com.minimalai.training.ExperienceBuffer;
 import com.minimalai.training.RewardComputer;
@@ -27,7 +28,7 @@ import java.util.stream.Collectors;
 public class BotCommand implements CommandExecutor, TabCompleter {
 
     private static final String PREFIX = ChatColor.GRAY + "[" + ChatColor.AQUA + "MinimalAI" + ChatColor.GRAY + "] " + ChatColor.RESET;
-    private static final List<String> SUB_COMMANDS = Arrays.asList("spawn", "despawn", "list");
+    private static final List<String> SUB_COMMANDS = Arrays.asList("spawn", "despawn", "list", "savekit", "deletekit", "kits");
 
     private final FakePlayerManager botManager;
     private final ModelManager modelManager;
@@ -36,6 +37,7 @@ public class BotCommand implements CommandExecutor, TabCompleter {
     private final @Nullable ArcaneSigilsAPI sigilsApi;
     private final @Nullable ExperienceBuffer experienceBuffer;
     private final @Nullable RewardComputer rewardComputer;
+    private final KitManager kitManager;
 
     // BotBrain instances managed here, ticked by MinimalAIPlugin
     private final Map<String, BotBrain> brains = new ConcurrentHashMap<>();
@@ -46,7 +48,8 @@ public class BotCommand implements CommandExecutor, TabCompleter {
                       ActionExecutor actionExecutor,
                       @Nullable ArcaneSigilsAPI sigilsApi,
                       @Nullable ExperienceBuffer experienceBuffer,
-                      @Nullable RewardComputer rewardComputer) {
+                      @Nullable RewardComputer rewardComputer,
+                      KitManager kitManager) {
         this.botManager = botManager;
         this.modelManager = modelManager;
         this.obsBuilder = obsBuilder;
@@ -54,6 +57,7 @@ public class BotCommand implements CommandExecutor, TabCompleter {
         this.sigilsApi = sigilsApi;
         this.experienceBuffer = experienceBuffer;
         this.rewardComputer = rewardComputer;
+        this.kitManager = kitManager;
     }
 
     @Override
@@ -67,6 +71,9 @@ public class BotCommand implements CommandExecutor, TabCompleter {
             case "spawn" -> handleSpawn(sender, args);
             case "despawn" -> handleDespawn(sender, args);
             case "list" -> handleList(sender);
+            case "savekit" -> handleSaveKit(sender, args);
+            case "deletekit" -> handleDeleteKit(sender, args);
+            case "kits" -> handleListKits(sender);
             default -> sendUsage(sender);
         }
         return true;
@@ -84,13 +91,32 @@ public class BotCommand implements CommandExecutor, TabCompleter {
             return;
         }
 
-        String name = args.length >= 2 ? args[1] : null;
+        // Parse: /bot spawn [name] [kit:<kitname>]
+        String name = null;
+        String kitName = null;
+        for (int i = 1; i < args.length; i++) {
+            if (args[i].toLowerCase().startsWith("kit:")) {
+                kitName = args[i].substring(4);
+            } else if (name == null) {
+                name = args[i];
+            }
+        }
+
         Location loc = player.getLocation();
 
         BotContext ctx = botManager.spawn(player.getWorld(), loc, name);
         if (ctx == null) {
             sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot. Check console.");
             return;
+        }
+
+        // Apply kit if specified
+        if (kitName != null) {
+            if (kitManager.applyKit(ctx.serverPlayer(), kitName)) {
+                sender.sendMessage(PREFIX + ChatColor.GREEN + "Applied kit '" + kitName + "'.");
+            } else {
+                sender.sendMessage(PREFIX + ChatColor.YELLOW + "Kit '" + kitName + "' not found. Bot spawned without gear.");
+            }
         }
 
         // Create BotBrain
@@ -167,11 +193,57 @@ public class BotCommand implements CommandExecutor, TabCompleter {
         }
     }
 
+    private void handleSaveKit(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Only players can save kits.");
+            return;
+        }
+        if (args.length < 2) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /bot savekit <name>");
+            return;
+        }
+        String kitName = args[1].toLowerCase();
+        try {
+            kitManager.saveKit(player, kitName);
+            sender.sendMessage(PREFIX + ChatColor.GREEN + "Saved your inventory as kit '" + kitName + "'.");
+        } catch (Exception e) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to save kit: " + e.getMessage());
+        }
+    }
+
+    private void handleDeleteKit(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /bot deletekit <name>");
+            return;
+        }
+        String kitName = args[1].toLowerCase();
+        if (kitManager.deleteKit(kitName)) {
+            sender.sendMessage(PREFIX + ChatColor.GREEN + "Deleted kit '" + kitName + "'.");
+        } else {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Kit '" + kitName + "' not found.");
+        }
+    }
+
+    private void handleListKits(CommandSender sender) {
+        List<String> kits = kitManager.listKits();
+        if (kits.isEmpty()) {
+            sender.sendMessage(PREFIX + ChatColor.YELLOW + "No saved kits. Use /bot savekit <name> to save your inventory.");
+            return;
+        }
+        sender.sendMessage(PREFIX + ChatColor.GREEN + "Saved kits (" + kits.size() + "):");
+        for (String kit : kits) {
+            sender.sendMessage(ChatColor.GRAY + " - " + ChatColor.WHITE + kit);
+        }
+    }
+
     private void sendUsage(CommandSender sender) {
         sender.sendMessage(PREFIX + ChatColor.YELLOW + "Usage:");
-        sender.sendMessage(ChatColor.GRAY + "  /bot spawn [name]" + ChatColor.WHITE + " - Spawn AI bot");
+        sender.sendMessage(ChatColor.GRAY + "  /bot spawn [name] [kit:<kit>]" + ChatColor.WHITE + " - Spawn AI bot");
         sender.sendMessage(ChatColor.GRAY + "  /bot despawn <name|*>" + ChatColor.WHITE + " - Remove bot(s)");
         sender.sendMessage(ChatColor.GRAY + "  /bot list" + ChatColor.WHITE + " - List active bots");
+        sender.sendMessage(ChatColor.GRAY + "  /bot savekit <name>" + ChatColor.WHITE + " - Save your inventory as a kit");
+        sender.sendMessage(ChatColor.GRAY + "  /bot deletekit <name>" + ChatColor.WHITE + " - Delete a saved kit");
+        sender.sendMessage(ChatColor.GRAY + "  /bot kits" + ChatColor.WHITE + " - List saved kits");
     }
 
     /** Called by MinimalAIPlugin tick loop. */
@@ -199,12 +271,34 @@ public class BotCommand implements CommandExecutor, TabCompleter {
         if (args.length == 1) {
             return filterStartsWith(SUB_COMMANDS, args[0]);
         }
-        if (args.length == 2 && "despawn".equalsIgnoreCase(args[0])) {
-            List<String> names = botManager.getAllBots().stream()
-                    .map(BotContext::name)
-                    .collect(Collectors.toList());
-            names.add("*");
-            return filterStartsWith(names, args[1]);
+        String sub = args[0].toLowerCase();
+        if (args.length == 2) {
+            if ("despawn".equals(sub)) {
+                List<String> names = botManager.getAllBots().stream()
+                        .map(BotContext::name)
+                        .collect(Collectors.toList());
+                names.add("*");
+                return filterStartsWith(names, args[1]);
+            }
+            if ("deletekit".equals(sub)) {
+                return filterStartsWith(kitManager.listKits(), args[1]);
+            }
+        }
+        // For spawn, suggest kit: prefix after name
+        if ("spawn".equals(sub) && args.length >= 2) {
+            String last = args[args.length - 1];
+            if (last.toLowerCase().startsWith("kit:")) {
+                String kitPrefix = last.substring(4);
+                return kitManager.listKits().stream()
+                        .filter(k -> k.toLowerCase().startsWith(kitPrefix.toLowerCase()))
+                        .map(k -> "kit:" + k)
+                        .collect(Collectors.toList());
+            }
+            if (args.length == 3) {
+                return filterStartsWith(
+                        kitManager.listKits().stream().map(k -> "kit:" + k).collect(Collectors.toList()),
+                        last);
+            }
         }
         return List.of();
     }

@@ -3,6 +3,7 @@ package com.minimalai;
 import com.minimalai.ai.*;
 import com.minimalai.bot.BotBrain;
 import com.minimalai.bot.FakePlayerManager;
+import com.minimalai.bot.KitManager;
 import com.minimalai.commands.BotCommand;
 import com.minimalai.commands.ModelCommand;
 import com.minimalai.commands.TrainCommand;
@@ -116,9 +117,13 @@ public class MinimalAIPlugin extends JavaPlugin {
             episodeManager.startEpisode(event.botName());
         });
 
+        // Initialize kit manager
+        Path kitsDir = getDataFolder().toPath().resolve("kits");
+        KitManager kitManager = new KitManager(kitsDir, getLogger());
+
         // Register commands
         botCmd = new BotCommand(botManager, modelManager, obsBuilder, actionExecutor,
-                sigilsApi, experienceBuffer, rewardComputer);
+                sigilsApi, experienceBuffer, rewardComputer, kitManager);
         getCommand("bot").setExecutor(botCmd);
         getCommand("bot").setTabCompleter(botCmd);
 
