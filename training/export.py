@@ -50,17 +50,21 @@ def export_model(checkpoint_path: str, output_path: str):
     wrapper = InferenceWrapper(network)
     wrapper.eval()
 
+    # Use realistic example inputs (at least one entity visible) to trace the main code path
+    entity_mask = torch.zeros(1, 32)
+    entity_mask[0, 0] = 1.0  # one visible entity
     example = (
-        torch.zeros(1, 30),
-        torch.zeros(1, 32, 20),
-        torch.zeros(1, 32),
-        torch.zeros(1, 22),
-        torch.zeros(1, 12),
-        torch.zeros(1, 8),
+        torch.randn(1, 30),
+        torch.randn(1, 32, 20),
+        entity_mask,
+        torch.randn(1, 22),
+        torch.randn(1, 12),
+        torch.randn(1, 8),
         torch.zeros(1, 1, 128),
     )
 
-    scripted = torch.jit.trace(wrapper, example)
+    with torch.no_grad():
+        scripted = torch.jit.trace(wrapper, example, check_trace=False)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     scripted.save(output_path)
     print(f"  Exported to: {output_path}")

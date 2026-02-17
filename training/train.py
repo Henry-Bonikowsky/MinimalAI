@@ -185,6 +185,18 @@ def train(config: TrainingConfig, resume_path: str = None):
                 saved_skills.add(skill_name)
                 print(f"  >> Saved skill checkpoint: {skill_name} at step {ppo.total_steps:,}")
 
+    # Save any remaining skill checkpoints (handles rounding at end of training)
+    for skill_name, skill_step in config.skill_checkpoints.items():
+        if skill_name not in saved_skills:
+            path = os.path.join(config.checkpoint_dir, f"skill_{skill_name}.pt")
+            ppo.save_checkpoint(path, metadata={
+                "skill_level": skill_name,
+                "steps": ppo.total_steps,
+                "mean_reward": best_mean_reward,
+            })
+            saved_skills.add(skill_name)
+            print(f"  >> Saved skill checkpoint: {skill_name} at step {ppo.total_steps:,}")
+
     # Final save
     ppo.save_checkpoint(
         os.path.join(config.checkpoint_dir, "final.pt"),
