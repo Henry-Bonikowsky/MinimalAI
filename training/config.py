@@ -1,4 +1,4 @@
-"""Training configuration for MinimalAI combat AI."""
+"""Training configuration for MinimalAI combat AI (v2)."""
 
 from dataclasses import dataclass
 
@@ -8,8 +8,9 @@ class TrainingConfig:
     # Environment
     num_enemies: int = 1
     num_allies: int = 0
-    episode_length: int = 1800  # 90 seconds at 20 TPS
+    episode_length: int = 600  # 30 seconds at 20 TPS - forces engagement
     domain_randomization: bool = True
+    self_play: bool = False
 
     # PPO
     lr: float = 3e-4
@@ -18,7 +19,7 @@ class TrainingConfig:
     clip_range: float = 0.2
     entropy_coef: float = 0.01
     entropy_coef_start: float = 0.05
-    entropy_coef_end: float = 0.005
+    entropy_coef_end: float = 0.01  # higher floor prevents policy collapse
     entropy_decay_steps: int = 500_000
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -27,19 +28,22 @@ class TrainingConfig:
     target_kl: float = 0.02
 
     # Rollout
-    rollout_steps: int = 2048  # steps per rollout
-    total_timesteps: int = 2_000_000  # total training steps
+    rollout_steps: int = 2048
+    total_timesteps: int = 2_000_000
 
-    # Checkpoints (5 difficulty levels)
-    checkpoint_interval: int = 50_000  # save every N steps
+    # Self-play
+    opponent_update_interval: int = 50  # copy weights every N updates
+
+    # Checkpoints
+    checkpoint_interval: int = 50_000
     checkpoint_dir: str = "checkpoints"
-    skill_checkpoints: dict = None  # populated during training
+    skill_checkpoints: dict = None
 
     # Logging
-    log_interval: int = 5  # log every N updates
+    log_interval: int = 5
     log_dir: str = "logs"
 
-    # Device - CPU only (GPU is occupied)
+    # Device
     device: str = "cpu"
 
     # Seed
@@ -47,7 +51,6 @@ class TrainingConfig:
 
     def __post_init__(self):
         if self.skill_checkpoints is None:
-            # 5 skill levels at percentage milestones
             total = self.total_timesteps
             self.skill_checkpoints = {
                 "novice": int(total * 0.10),
@@ -60,7 +63,6 @@ class TrainingConfig:
 
 @dataclass
 class EvalConfig:
-    """Config for evaluating trained models."""
     num_eval_episodes: int = 20
     num_enemies: int = 1
     render: bool = False

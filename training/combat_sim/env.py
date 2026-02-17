@@ -1,64 +1,76 @@
-"""Gymnasium environment for Minecraft PvP combat simulation.
+"""Gymnasium environment for 1.8 PvP combat simulation.
 
-Supports 1vN and NvN scenarios with variable entity counts.
-Observation is a dict with self_state, entity_features, combat_ctx, sigil_state, env_state.
-Action is a multi-binary vector of 28 discrete actions.
+Supports 1vN, NvN, and self-play with:
+- 35-action multi-binary space
+- Kit items (gaps, pots, pearls, totems)
+- 12 sigil slots (4 weapon always + 4 armor randomized)
+- Direct target selection by entity index
+- 1.8 combat mechanics (no cooldown, blockhit, sprint reset)
 """
 
+import logging
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from .entities import Agent, Alliance, WeaponType, WEAPON_STATS, MAX_HEALTH, ARENA_SIZE, SPRINT_SPEED
+from .entities import (
+    Agent, Alliance, WeaponType, WEAPON_STATS, MAX_HEALTH, ARENA_SIZE,
+    SPRINT_SPEED, NUM_SIGIL_SLOTS, KIT_GOLDEN_APPLES, KIT_HEALTH_POTS,
+    KIT_ENDER_PEARLS, KIT_TOTEMS,
+)
 from .physics import CombatPhysics
+from .sigils import SigilEngine, randomize_loadout
+
+logger = logging.getLogger("combat_sim")
 
 
-# Action indices
+# Action indices (35 total)
 ACT_FORWARD = 0
 ACT_BACKWARD = 1
-ACT_LEFT = 2
-ACT_RIGHT = 3
+ACT_STRAFE_LEFT = 2
+ACT_STRAFE_RIGHT = 3
 ACT_JUMP = 4
 ACT_SNEAK = 5
 ACT_SPRINT = 6
 ACT_ATTACK = 7
-ACT_USE = 8
-ACT_SWITCH_WEAPON = 9
-ACT_SWITCH_CONSUMABLE = 10
-ACT_CONSUME = 11
-ACT_WTAP = 12
-ACT_STRAFE_LEFT_ATTACK = 13
-ACT_STRAFE_RIGHT_ATTACK = 14
-ACT_BLOCK_HIT = 15
-ACT_SIGIL_0 = 16
-ACT_SIGIL_1 = 17
-ACT_SIGIL_2 = 18
-ACT_SIGIL_3 = 19
-ACT_LOOK_UP = 20
-ACT_LOOK_DOWN = 21
-ACT_LOOK_LEFT = 22
-ACT_LOOK_RIGHT = 23
-ACT_TARGET_NEAREST = 24
-ACT_TARGET_LOWEST_HP = 25
-ACT_TARGET_HIGHEST_THREAT = 26
-ACT_TARGET_CYCLE = 27
+ACT_BLOCK = 8          # 1.8 sword block
+ACT_EAT_GAP = 9        # golden apple
+ACT_THROW_POT = 10     # splash health pot
+ACT_THROW_PEARL = 11   # ender pearl
+ACT_SPRINT_RESET = 12  # toggle sprint for KB reset
+ACT_SWAP_WEAPON = 13   # switch sword <-> axe
 
-NUM_ACTIONS = 28
+# Sigil ability activations (12 slots, only ABILITYs unmasked)
+ACT_SIGIL_0 = 14
+ACT_SIGIL_11 = 25
+
+# Camera
+ACT_LOOK_LEFT = 26
+ACT_LOOK_RIGHT = 27
+ACT_LOOK_UP = 28
+ACT_LOOK_DOWN = 29
+
+# Direct target selection
+ACT_TARGET_0 = 30
+ACT_TARGET_4 = 34
+
+NUM_ACTIONS = 35
 MAX_ENTITIES = 32
-ENTITY_FEATURE_DIM = 20
-SELF_STATE_DIM = 30
-COMBAT_CTX_DIM = 22
-SIGIL_STATE_DIM = 12
+SELF_STATE_DIM = 38
+ENTITY_FEATURE_DIM = 24
+COMBAT_CTX_DIM = 26
+SIGIL_STATE_DIM = NUM_SIGIL_SLOTS * 4  # 48
 ENV_STATE_DIM = 8
 
 
 class CombatEnv(gym.Env):
-    """Minecraft PvP combat environment.
+    """1.8 PvP combat environment with kit and sigils.
 
     Args:
         num_enemies: Number of enemy agents.
         num_allies: Number of ally agents (not counting the player).
         episode_length: Max ticks per episode.
         domain_randomization: Whether to randomize physics params.
+        self_play: If True, opponent is controlled by an external network.
     """
 
     metadata = {"render_modes": ["human", "none"], "render_fps": 20}
@@ -69,6 +81,7 @@ class CombatEnv(gym.Env):
         num_allies: int = 0,
         episode_length: int = 1800,
         domain_randomization: bool = True,
+        self_play: bool = False,
         render_mode: str = "none",
         seed: int = None,
     ):
@@ -78,6 +91,7 @@ class CombatEnv(gym.Env):
         self.num_allies = num_allies
         self.episode_length = episode_length
         self.render_mode = render_mode
+        self.self_play = self_play
 
         self.rng = np.random.default_rng(seed)
         self.physics = CombatPhysics(domain_randomization=domain_randomization, rng=self.rng)
@@ -88,10 +102,13 @@ class CombatEnv(gym.Env):
         self.allies: list[Agent] = []
         self._all_entities: list[Agent] = []
 
-        # Action space: multi-binary (each action is independently on/off)
+        # Self-play opponent action storage
+        self._opponent_actions: dict = {}  # agent_id -> action array
+
+        # Action space: multi-binary
         self.action_space = spaces.MultiBinary(NUM_ACTIONS)
 
-        # Observation space: dict of arrays
+        # Observation space
         self.observation_space = spaces.Dict({
             "self_state": spaces.Box(-1, 1, shape=(SELF_STATE_DIM,), dtype=np.float32),
             "entity_features": spaces.Box(-1, 1, shape=(MAX_ENTITIES, ENTITY_FEATURE_DIM), dtype=np.float32),
@@ -103,11 +120,12 @@ class CombatEnv(gym.Env):
 
         self.current_tick = 0
         self.episode_reward = 0.0
-
-        # Reward tracking
         self._prev_health_diff = 0.0
         self._prev_dist_to_target = 0.0
         self._prev_facing_target = 0.0
+
+        # Sorted entities for target selection (updated each tick)
+        self._sorted_enemies: list[Agent] = []
 
     def _create_entities(self):
         """Create enemy and ally agents."""
@@ -133,6 +151,7 @@ class CombatEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
             self.physics.rng = self.rng
+            self.physics.sigil_engine.rng = self.rng
 
         self.physics.randomize_params()
         self._create_entities()
@@ -140,15 +159,21 @@ class CombatEnv(gym.Env):
         # Spawn player at center
         self.player.reset(x=0.0, z=0.0, facing=0.0)
 
-        # Spawn enemies in a circle around player
+        # Spawn enemies in a circle
         for i, enemy in enumerate(self.enemies):
             angle = 2 * np.pi * i / max(self.num_enemies, 1) + self.rng.uniform(-0.3, 0.3)
             dist = self.rng.uniform(4.0, 8.0)
             enemy.reset(
                 x=np.cos(angle) * dist,
                 z=np.sin(angle) * dist,
-                facing=angle + np.pi,  # face toward center
+                facing=angle + np.pi,
             )
+            # Scripted enemy: no healing items (AI must learn to kill first)
+            if not self.self_play:
+                enemy.kit.golden_apples = 0
+                enemy.kit.health_pots = 0
+                enemy.kit.ender_pearls = 0
+                enemy.kit.totems = 0
 
         # Spawn allies near player
         for i, ally in enumerate(self.allies):
@@ -160,6 +185,11 @@ class CombatEnv(gym.Env):
                 facing=angle + np.pi,
             )
 
+        # Randomize sigil loadouts
+        randomize_loadout(self.player, self.rng)
+        for entity in self._all_entities:
+            randomize_loadout(entity, self.rng)
+
         # Default target: nearest enemy
         self.player.target_id = self.enemies[0].agent_id if self.enemies else -1
 
@@ -168,107 +198,183 @@ class CombatEnv(gym.Env):
         self._prev_health_diff = 0.0
         self._prev_dist_to_target = ARENA_SIZE
         self._prev_facing_target = 0.0
+        self._opponent_actions = {}
+        self._update_sorted_enemies()
 
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
 
+    def set_opponent_action(self, agent_id: int, action: np.ndarray):
+        """Set action for a self-play opponent agent (called externally)."""
+        self._opponent_actions[agent_id] = action
+
+    def get_opponent_obs(self, agent_id: int) -> dict:
+        """Get observation from an opponent's perspective (for self-play)."""
+        agent = None
+        for e in self.enemies:
+            if e.agent_id == agent_id:
+                agent = e
+                break
+        if agent is None:
+            return None
+        return self._get_obs_for(agent)
+
     def step(self, action: np.ndarray):
-        """Execute one tick of the simulation.
-
-        Args:
-            action: Binary array of shape (28,).
-
-        Returns:
-            obs, reward, terminated, truncated, info
-        """
+        """Execute one tick of the simulation."""
         self.current_tick += 1
 
-        # Apply action masking (resolve conflicts)
+        # Apply action masking
         action = self._apply_action_mask(action)
 
         # Execute player actions
-        self._execute_player_actions(action)
+        self._execute_actions(self.player, action)
 
-        # Execute enemy AI (simple rule-based for training)
+        # Execute enemy actions
         for enemy in self.enemies:
             if enemy.is_alive:
-                self._enemy_ai(enemy)
+                if self.self_play and enemy.agent_id in self._opponent_actions:
+                    opp_action = self._opponent_actions[enemy.agent_id]
+                    opp_action = self._apply_action_mask_for(enemy, opp_action)
+                    self._execute_actions(enemy, opp_action)
+                else:
+                    self._enemy_ai(enemy)
 
-        # Execute ally AI (simple follow + attack)
+        # Execute ally AI
         for ally in self.allies:
             if ally.is_alive:
                 self._ally_ai(ally)
 
-        # Calculate reward BEFORE physics tick (which resets damage counters)
+        # Tick mummies for all agents
+        all_agents = [self.player] + self._all_entities
+        for agent in all_agents:
+            self.physics.sigil_engine.tick_mummies(agent, all_agents, self.current_tick)
+
+        # Calculate reward BEFORE physics tick
         reward = self._calculate_reward()
 
-        # Tick physics for all agents (resets per-tick damage, applies drag/gravity)
+        # Log tick details BEFORE physics resets per-tick counters
+        if logger.isEnabledFor(logging.DEBUG):
+            p = self.player
+            e = self.enemies[0] if self.enemies else None
+            if p.damage_dealt_this_tick > 0 or p.damage_taken_this_tick > 0 or (e and e.damage_taken_this_tick > 0):
+                logger.debug(
+                    f"t={self.current_tick:4d} | "
+                    f"P hp={p.health:.1f} abs={p.absorption:.1f} immune={p.hurt_immune_ticks} | "
+                    f"E hp={e.health:.1f} immune={e.hurt_immune_ticks} | "
+                    f"P dealt={p.damage_dealt_this_tick:.2f} took={p.damage_taken_this_tick:.2f} | "
+                    f"E took={e.damage_taken_this_tick:.2f} | "
+                    f"dist={self.physics.distance_between(p, e):.1f}"
+                    if e else ""
+                )
+
+        # Tick physics for all agents
         self.physics.tick_physics(self.player)
         for entity in self._all_entities:
             self.physics.tick_physics(entity)
         self.episode_reward += reward
 
+        # Update sorted enemies for targeting
+        self._update_sorted_enemies()
+
         # Check termination
         terminated = not self.player.is_alive or all(not e.is_alive for e in self.enemies)
         truncated = self.current_tick >= self.episode_length
+
+        if terminated or truncated:
+            reason = "player_died" if not self.player.is_alive else (
+                "all_enemies_dead" if all(not e.is_alive for e in self.enemies) else "truncated"
+            )
+            logger.info(
+                f"Episode end: {reason} | tick={self.current_tick} | "
+                f"P hp={self.player.health:.1f} kills={self.player.kills} | "
+                f"reward={self.episode_reward:.3f} | "
+                f"gaps_used={KIT_GOLDEN_APPLES-self.player.kit.golden_apples} "
+                f"pots_used={KIT_HEALTH_POTS-self.player.kit.health_pots} "
+                f"pearls_used={KIT_ENDER_PEARLS-self.player.kit.ender_pearls}"
+            )
 
         obs = self._get_obs()
         info = self._get_info()
 
         return obs, reward, terminated, truncated, info
 
+    def _update_sorted_enemies(self):
+        """Sort alive enemies by distance to player."""
+        alive = [e for e in self.enemies if e.is_alive]
+        alive.sort(key=lambda e: self.physics.distance_between(self.player, e))
+        self._sorted_enemies = alive
+
     def _apply_action_mask(self, action: np.ndarray) -> np.ndarray:
-        """Resolve conflicting actions."""
+        """Resolve conflicting actions for the player."""
+        return self._apply_action_mask_for(self.player, action)
+
+    def _apply_action_mask_for(self, agent: Agent, action: np.ndarray) -> np.ndarray:
+        """Resolve conflicting actions for any agent."""
         action = action.copy()
 
-        # Movement conflicts: forward/backward
+        # Movement conflicts
         if action[ACT_FORWARD] and action[ACT_BACKWARD]:
             action[ACT_BACKWARD] = 0
-        # Left/right
-        if action[ACT_LEFT] and action[ACT_RIGHT]:
-            action[ACT_RIGHT] = 0
+        if action[ACT_STRAFE_LEFT] and action[ACT_STRAFE_RIGHT]:
+            action[ACT_STRAFE_RIGHT] = 0
 
-        # Combo actions override basic movement
-        if action[ACT_WTAP]:
-            action[ACT_FORWARD] = 1
-            action[ACT_ATTACK] = 1
-        if action[ACT_STRAFE_LEFT_ATTACK]:
-            action[ACT_LEFT] = 1
-            action[ACT_ATTACK] = 1
-        if action[ACT_STRAFE_RIGHT_ATTACK]:
-            action[ACT_RIGHT] = 1
-            action[ACT_ATTACK] = 1
-        if action[ACT_BLOCK_HIT]:
-            action[ACT_USE] = 1
-            action[ACT_ATTACK] = 1
+        # Kit masking
+        if agent.kit.golden_apples <= 0 or agent.kit.is_eating:
+            action[ACT_EAT_GAP] = 0
+        if agent.kit.health_pots <= 0 or agent.kit.pot_cooldown > 0:
+            action[ACT_THROW_POT] = 0
+        if agent.kit.ender_pearls <= 0 or agent.kit.pearl_cooldown > 0:
+            action[ACT_THROW_PEARL] = 0
 
-        # Mask sigils that are on cooldown or unavailable
-        for i in range(4):
-            bind = self.player.sigil_binds[i]
-            if not bind.available or bind.cooldown_remaining > 0:
+        # Sprint reset only if sprinting
+        if not agent.is_sprinting:
+            action[ACT_SPRINT_RESET] = 0
+
+        # Block only works with sword
+        if agent.weapon != WeaponType.SWORD:
+            action[ACT_BLOCK] = 0
+
+        # Sigil masking
+        sigil_mask = self.physics.sigil_engine.get_ability_mask(agent)
+        for i in range(NUM_SIGIL_SLOTS):
+            if sigil_mask[i] == 0.0:
                 action[ACT_SIGIL_0 + i] = 0
+
+        # Target masking
+        for i in range(5):
+            if i >= len(self._sorted_enemies):
+                action[ACT_TARGET_0 + i] = 0
+
+        # Stun prevents all actions except passive
+        if agent.has_effect("stun"):
+            action[:] = 0
 
         return action
 
-    def _execute_player_actions(self, action: np.ndarray):
-        """Execute the player's action vector."""
-        player = self.player
-
+    def _execute_actions(self, agent: Agent, action: np.ndarray):
+        """Execute an agent's action vector."""
         # Sprint toggle
         if action[ACT_SPRINT]:
-            player.is_sprinting = True
+            agent.is_sprinting = True
         if action[ACT_SNEAK]:
-            player.is_sneaking = True
-            player.is_sprinting = False
+            agent.is_sneaking = True
+            agent.is_sprinting = False
         if not action[ACT_SPRINT] and not action[ACT_SNEAK]:
-            player.is_sneaking = False
+            agent.is_sneaking = False
 
-        # W-tap: release sprint briefly for knockback reset
-        if action[ACT_WTAP]:
-            self.physics.apply_wtap(player)
-            # Re-sprint next tick
-            player.is_sprinting = True
+        # Sprint reset (1.8 KB technique)
+        if action[ACT_SPRINT_RESET]:
+            self.physics.sprint_reset(agent)
+            # Re-sprint immediately
+            agent.is_sprinting = True
+
+        # Swap weapon
+        if action[ACT_SWAP_WEAPON]:
+            if agent.weapon == WeaponType.SWORD:
+                agent.weapon = WeaponType.AXE
+            else:
+                agent.weapon = WeaponType.SWORD
 
         # Movement
         forward = 0.0
@@ -277,210 +383,199 @@ class CombatEnv(gym.Env):
             forward += 1.0
         if action[ACT_BACKWARD]:
             forward -= 1.0
-        if action[ACT_LEFT]:
+        if action[ACT_STRAFE_LEFT]:
             strafe -= 1.0
-        if action[ACT_RIGHT]:
+        if action[ACT_STRAFE_RIGHT]:
             strafe += 1.0
 
-        self.physics.apply_movement(player, forward, strafe, bool(action[ACT_JUMP]))
+        self.physics.apply_movement(agent, forward, strafe, bool(action[ACT_JUMP]))
 
-        # Camera / facing
+        # Camera
         turn_speed = np.pi / 18  # 10 degrees per tick
         if action[ACT_LOOK_LEFT]:
-            self.physics.turn_agent(player, -turn_speed)
+            self.physics.turn_agent(agent, -turn_speed)
         if action[ACT_LOOK_RIGHT]:
-            self.physics.turn_agent(player, turn_speed)
-        # Look up/down affects Y aim but we're mostly 2D for v1
+            self.physics.turn_agent(agent, turn_speed)
 
         # Auto-face target if no manual camera
-        if not any(action[ACT_LOOK_LEFT:ACT_LOOK_RIGHT + 1]):
-            target = self._get_target()
+        if not action[ACT_LOOK_LEFT] and not action[ACT_LOOK_RIGHT]:
+            target = self._get_target_for(agent)
             if target is not None:
-                self.physics.face_toward(player, target, max_turn=np.pi / 6)
+                self.physics.face_toward(agent, target, max_turn=np.pi / 6)
 
-        # Target selection
-        if action[ACT_TARGET_NEAREST]:
-            self._select_target_nearest()
-        elif action[ACT_TARGET_LOWEST_HP]:
-            self._select_target_lowest_hp()
-        elif action[ACT_TARGET_HIGHEST_THREAT]:
-            self._select_target_highest_threat()
-        elif action[ACT_TARGET_CYCLE]:
-            self._cycle_target()
+        # Target selection (direct index)
+        for i in range(5):
+            if action[ACT_TARGET_0 + i]:
+                if agent is self.player and i < len(self._sorted_enemies):
+                    agent.target_id = self._sorted_enemies[i].agent_id
+                break
 
-        # Blocking
-        player.is_blocking = bool(action[ACT_USE]) and not action[ACT_ATTACK]
+        # 1.8 blockhit: BLOCK + ATTACK = both active simultaneously
+        agent.is_blocking = bool(action[ACT_BLOCK])
+
+        # Eating
+        if action[ACT_EAT_GAP]:
+            self.physics.start_eating(agent)
+            logger.debug(f"t={self.current_tick} | Agent {agent.agent_id} started eating gap")
+        elif agent.kit.is_eating and action[ACT_ATTACK]:
+            self.physics.cancel_eating(agent)
+
+        # Health pot
+        if action[ACT_THROW_POT]:
+            self.physics.throw_pot(agent)
+            logger.debug(f"t={self.current_tick} | Agent {agent.agent_id} threw pot (hp={agent.health:.1f})")
+
+        # Ender pearl
+        if action[ACT_THROW_PEARL]:
+            self.physics.throw_pearl(agent)
+            logger.debug(f"t={self.current_tick} | Agent {agent.agent_id} threw pearl")
 
         # Attack
         if action[ACT_ATTACK]:
-            target = self._get_target()
+            target = self._get_target_for(agent)
             if target is not None:
-                self.physics.try_attack(player, target, self.current_tick)
+                self.physics.try_attack(agent, target, self.current_tick)
 
-        # Sigil activation
-        for i in range(4):
+        # Sigil activations
+        all_agents = [self.player] + self._all_entities
+        for i in range(NUM_SIGIL_SLOTS):
             if action[ACT_SIGIL_0 + i]:
-                self.physics.activate_sigil(player, i, self._all_entities, self.current_tick)
+                self.physics.sigil_engine.activate_ability(
+                    agent, i, all_agents, self.current_tick
+                )
 
-    def _get_target(self) -> Agent | None:
-        """Get the player's current target."""
-        for entity in self._all_entities:
-            if entity.agent_id == self.player.target_id and entity.is_alive:
+    def _get_target_for(self, agent: Agent) -> Agent | None:
+        """Get an agent's current target."""
+        for entity in self._all_entities + [self.player]:
+            if entity.agent_id == agent.target_id and entity.is_alive:
                 return entity
-        # Fallback: nearest enemy
-        return self._nearest_alive_enemy()
+        # Fallback: nearest alive enemy (relative to agent)
+        if agent.alliance == Alliance.ALLY:
+            return self._nearest_alive(agent, self.enemies)
+        else:
+            targets = [self.player] + self.allies
+            return self._nearest_alive(agent, targets)
 
-    def _nearest_alive_enemy(self) -> Agent | None:
-        """Find the nearest alive enemy."""
+    def _nearest_alive(self, agent: Agent, candidates: list) -> Agent | None:
         best = None
         best_dist = float("inf")
-        for enemy in self.enemies:
-            if enemy.is_alive:
-                dist = self.physics.distance_between(self.player, enemy)
+        for c in candidates:
+            if c.is_alive and c.agent_id != agent.agent_id:
+                dist = self.physics.distance_between(agent, c)
                 if dist < best_dist:
                     best_dist = dist
-                    best = enemy
+                    best = c
         return best
 
-    def _select_target_nearest(self):
-        target = self._nearest_alive_enemy()
-        if target:
-            self.player.target_id = target.agent_id
-
-    def _select_target_lowest_hp(self):
-        best = None
-        best_hp = float("inf")
-        for enemy in self.enemies:
-            if enemy.is_alive and enemy.health < best_hp:
-                best_hp = enemy.health
-                best = enemy
-        if best:
-            self.player.target_id = best.agent_id
-
-    def _select_target_highest_threat(self):
-        """Target the enemy closest and most dangerous."""
-        best = None
-        best_score = -float("inf")
-        for enemy in self.enemies:
-            if enemy.is_alive:
-                dist = self.physics.distance_between(self.player, enemy)
-                # Threat = inverse distance * damage potential
-                weapon_dmg = WEAPON_STATS[enemy.weapon]["damage"]
-                score = weapon_dmg / max(dist, 0.5)
-                if score > best_score:
-                    best_score = score
-                    best = enemy
-        if best:
-            self.player.target_id = best.agent_id
-
-    def _cycle_target(self):
-        """Cycle to next alive enemy."""
-        alive = [e for e in self.enemies if e.is_alive]
-        if not alive:
-            return
-        current_ids = [e.agent_id for e in alive]
-        if self.player.target_id in current_ids:
-            idx = current_ids.index(self.player.target_id)
-            next_idx = (idx + 1) % len(current_ids)
-            self.player.target_id = current_ids[next_idx]
-        else:
-            self.player.target_id = current_ids[0]
-
     def _enemy_ai(self, enemy: Agent):
-        """Simple rule-based enemy AI for training.
+        """Rule-based enemy AI for training (when not self-play).
 
-        Varies behavior to create diverse training scenarios.
+        Deliberately mediocre opponent:
+        - Low CPS (~6-8 clicks/sec)
+        - Slow to engage, sometimes wanders
+        - Rarely blocks or uses kit items
+        - Doesn't sprint-reset or combo
         """
         dist = self.physics.distance_between(enemy, self.player)
 
-        # Face player
-        self.physics.face_toward(enemy, self.player, max_turn=np.pi / 8)
+        # Slow aim tracking (worse than perfect)
+        self.physics.face_toward(enemy, self.player, max_turn=np.pi / 12)
 
-        # Move toward player if far, circle if close
-        if dist > 4.0:
-            # Approach
-            forward = 1.0
-            strafe = 0.0
-            enemy.is_sprinting = True
-        elif dist > 2.0:
-            # Combat range - mix of approach and strafing
-            forward = 0.3
-            strafe = self.rng.choice([-1.0, 1.0]) * 0.7
-            enemy.is_sprinting = self.rng.random() > 0.5
+        # Movement: hesitant, doesn't always rush in
+        if dist > 6.0:
+            # Sometimes just wanders instead of chasing
+            if self.rng.random() < 0.7:
+                forward = 0.8
+                strafe = self.rng.choice([-0.3, 0.3])
+                enemy.is_sprinting = self.rng.random() > 0.4
+            else:
+                forward = 0.0
+                strafe = self.rng.choice([-1.0, 1.0])
+                enemy.is_sprinting = False
+        elif dist > 3.0:
+            forward = 0.5
+            strafe = self.rng.choice([-1.0, 1.0]) * 0.5
+            enemy.is_sprinting = self.rng.random() > 0.6
         else:
-            # Very close - back up sometimes
-            forward = self.rng.choice([-0.5, 0.3])
+            # In melee range: strafe around, sometimes back up
+            forward = self.rng.choice([-0.5, 0.0, 0.3])
             strafe = self.rng.choice([-1.0, 1.0])
             enemy.is_sprinting = False
 
-        self.physics.apply_movement(enemy, forward, strafe, jump=self.rng.random() > 0.85)
+        self.physics.apply_movement(enemy, forward, strafe, jump=self.rng.random() > 0.92)
 
-        # Attack when in range and cooldown ready
-        if dist <= 3.0 and enemy.attack_cooldown == 0:
+        # ~10 CPS but capped by 5-tick hurt immunity anyway
+        if dist <= 3.0 and enemy.attack_tick_cooldown == 0 and self.rng.random() < 0.5:
             self.physics.try_attack(enemy, self.player, self.current_tick)
 
-    def _ally_ai(self, ally: Agent):
-        """Simple ally AI - follow player and attack nearest enemy."""
-        # Find nearest enemy
-        target = None
-        best_dist = float("inf")
-        for enemy in self.enemies:
-            if enemy.is_alive:
-                d = self.physics.distance_between(ally, enemy)
-                if d < best_dist:
-                    best_dist = d
-                    target = enemy
+        # Rarely blockhits
+        if dist <= 3.0 and enemy.weapon == WeaponType.SWORD:
+            enemy.is_blocking = self.rng.random() < 0.05
 
+        # Only use healing if enemy has items (self-play mode)
+        if enemy.kit.golden_apples > 0 and enemy.health < 8.0 and self.rng.random() > 0.97:
+            self.physics.start_eating(enemy)
+        if enemy.kit.health_pots > 0 and enemy.health < 5.0 and self.rng.random() > 0.85:
+            self.physics.throw_pot(enemy)
+
+    def _ally_ai(self, ally: Agent):
+        """Simple ally AI - follow player, attack nearest enemy."""
+        target = self._nearest_alive(ally, self.enemies)
         if target is None:
-            # Follow player
             self.physics.face_toward(ally, self.player, max_turn=np.pi / 8)
-            dist_to_player = self.physics.distance_between(ally, self.player)
-            if dist_to_player > 5.0:
+            if self.physics.distance_between(ally, self.player) > 5.0:
                 self.physics.apply_movement(ally, 1.0, 0.0, False)
                 ally.is_sprinting = True
             return
 
         self.physics.face_toward(ally, target, max_turn=np.pi / 8)
-
-        if best_dist > 3.0:
+        dist = self.physics.distance_between(ally, target)
+        if dist > 3.0:
             self.physics.apply_movement(ally, 1.0, 0.0, False)
             ally.is_sprinting = True
         else:
             self.physics.apply_movement(ally, 0.3, self.rng.choice([-0.5, 0.5]), False)
-            if ally.attack_cooldown == 0:
+            if ally.attack_tick_cooldown == 0:
                 self.physics.try_attack(ally, target, self.current_tick)
 
     def _calculate_reward(self) -> float:
-        """Calculate reward for the current tick. Normalized to [-1, 1]."""
+        """Calculate reward for the current tick.
+
+        Reward design:
+        - Strong positive for kills (+5.0)
+        - Moderate negative for dying (-3.0)
+        - Dense reward for dealing damage (encourages aggression)
+        - Small penalty for taking damage (doesn't discourage engagement)
+        - Potential-based shaping for approach + health advantage
+        """
         reward = 0.0
         player = self.player
 
-        # === Sparse event rewards ===
-        # Kill
+        # Sparse: kill (strong positive signal)
         if player.damage_dealt_this_tick > 0:
             for enemy in self.enemies:
                 if not enemy.is_alive and enemy.last_hurt_tick == self.current_tick:
-                    reward += 1.0  # kill reward
+                    reward += 5.0
 
-        # Death
+        # Sparse: death
         if not player.is_alive:
-            reward -= 1.0
+            reward -= 3.0
 
-        # === Dense combat rewards ===
-        # Damage dealt (normalized by max health)
-        reward += (player.damage_dealt_this_tick / MAX_HEALTH) * 0.1
+        # Dense: damage dealt (strong - encourage aggression)
+        reward += (player.damage_dealt_this_tick / MAX_HEALTH) * 0.5
 
-        # Damage taken (asymmetric - dealing > taking)
-        reward -= (player.damage_taken_this_tick / MAX_HEALTH) * 0.05
+        # Dense: damage taken (weak - don't discourage engagement)
+        reward -= (player.damage_taken_this_tick / MAX_HEALTH) * 0.1
 
-        # === Potential-based shaping ===
-        target = self._get_target()
+        # Potential-based shaping
+        target = self._get_target_for(player)
         if target is not None and target.is_alive:
-            # Health difference
-            health_diff = (player.health - target.health) / MAX_HEALTH
-
-            # Distance to target (optimal range: 2-3.5 blocks)
             dist = self.physics.distance_between(player, target)
+
+            # Distance potential: closer is better (smooth, not binary)
+            dist_potential = max(0.0, 1.0 - dist / ARENA_SIZE)
+
+            # In-range bonus
             in_range = 1.0 if 2.0 <= dist <= 3.5 else 0.0
 
             # Facing target
@@ -491,14 +586,26 @@ class CombatEnv(gym.Env):
             angle_diff = min(angle_diff, 2 * np.pi - angle_diff)
             facing = 1.0 if angle_diff < np.pi / 6 else 0.0
 
-            # Potential function
-            phi_current = 0.3 * health_diff + 0.1 * in_range + 0.05 * facing
-            phi_prev = 0.3 * self._prev_health_diff + 0.1 * (1.0 if self._prev_dist_to_target >= 2.0 and self._prev_dist_to_target <= 3.5 else 0.0) + 0.05 * self._prev_facing_target
+            # Health advantage
+            health_diff = (player.health - target.health) / MAX_HEALTH
 
-            # Potential-based shaping: gamma * phi(s') - phi(s)
+            phi_current = (
+                0.2 * health_diff +
+                0.15 * dist_potential +
+                0.1 * in_range +
+                0.05 * facing
+            )
+            prev_dist_potential = max(0.0, 1.0 - self._prev_dist_to_target / ARENA_SIZE)
+            prev_in_range = 1.0 if 2.0 <= self._prev_dist_to_target <= 3.5 else 0.0
+            phi_prev = (
+                0.2 * self._prev_health_diff +
+                0.15 * prev_dist_potential +
+                0.1 * prev_in_range +
+                0.05 * self._prev_facing_target
+            )
+
             reward += 0.99 * phi_current - phi_prev
 
-            # Update previous values
             self._prev_health_diff = health_diff
             self._prev_dist_to_target = dist
             self._prev_facing_target = facing
@@ -507,36 +614,42 @@ class CombatEnv(gym.Env):
             self._prev_dist_to_target = ARENA_SIZE
             self._prev_facing_target = 0.0
 
-        return float(np.clip(reward, -2.0, 2.0))
+        return float(np.clip(reward, -5.0, 5.0))
 
     def _get_obs(self) -> dict:
-        """Build the observation dictionary."""
-        player = self.player
+        """Build observation from player's perspective."""
+        return self._get_obs_for(self.player)
 
-        # Self state (30 dims)
-        self_state = player.get_self_state()
+    def _get_obs_for(self, agent: Agent) -> dict:
+        """Build observation from any agent's perspective."""
+        self_state = agent.get_self_state()
 
-        # Entity features (up to MAX_ENTITIES x 20)
         entity_features = np.zeros((MAX_ENTITIES, ENTITY_FEATURE_DIM), dtype=np.float32)
         entity_mask = np.zeros(MAX_ENTITIES, dtype=np.float32)
 
         idx = 0
-        for entity in self._all_entities:
+        all_others = [e for e in [self.player] + self._all_entities if e.agent_id != agent.agent_id]
+        for entity in all_others:
             if idx >= MAX_ENTITIES:
                 break
             if entity.is_alive:
-                entity_features[idx] = entity.get_entity_features(player)
+                entity_features[idx] = entity.get_entity_features(agent)
                 entity_mask[idx] = 1.0
                 idx += 1
 
-        # Combat context (22 dims)
-        combat_ctx = self._get_combat_context()
+        combat_ctx = self._get_combat_context(agent)
 
-        # Sigil state (12 dims)
-        sigil_state = player.get_sigil_state()
+        # Update sigil state with current tick info
+        sigil_state = agent.get_sigil_state()
+        for i, slot in enumerate(agent.sigil_slots):
+            # Update last_used normalized time
+            if slot.last_used_tick >= 0:
+                ticks_since = self.current_tick - slot.last_used_tick
+                sigil_state[i * 4 + 3] = min(1.0, ticks_since / 600.0)
+            else:
+                sigil_state[i * 4 + 3] = 1.0
 
-        # Environment state (8 dims)
-        env_state = self._get_env_state()
+        env_state = self._get_env_state(agent)
 
         return {
             "self_state": self_state,
@@ -547,72 +660,86 @@ class CombatEnv(gym.Env):
             "env_state": env_state,
         }
 
-    def _get_combat_context(self) -> np.ndarray:
-        """Build the 22-dim combat context vector."""
+    def _get_combat_context(self, agent: Agent) -> np.ndarray:
+        """Build 26-dim combat context vector."""
         ctx = np.zeros(COMBAT_CTX_DIM, dtype=np.float32)
-        player = self.player
 
         # Weapon info (3)
-        ctx[0] = float(player.weapon) / 2.0
-        ctx[1] = 0.0  # consumable count (sim has none)
-        ctx[2] = 1.0  # has weapon
+        ctx[0] = float(agent.weapon) / 2.0
+        ctx[1] = 1.0  # has weapon
+        ctx[2] = 1.0 if agent.weapon == WeaponType.SWORD else 0.0  # can block
 
-        # Special items (5) - all zero in v1 sim
-        # ctx[3:8] = 0.0
+        # Kit counts (4)
+        ctx[3] = agent.kit.golden_apples / max(KIT_GOLDEN_APPLES, 1)
+        ctx[4] = agent.kit.health_pots / max(KIT_HEALTH_POTS, 1)
+        ctx[5] = agent.kit.ender_pearls / max(KIT_ENDER_PEARLS, 1)
+        ctx[6] = agent.kit.totems / max(KIT_TOTEMS, 1)
 
-        # Selected slot (1)
-        ctx[8] = 0.0
+        # Kit state (2)
+        ctx[7] = 1.0 if agent.kit.is_eating else 0.0
+        ctx[8] = agent.kit.pearl_cooldown / 20.0
 
         # Recent combat (2)
-        ctx[9] = player.damage_dealt_this_tick / MAX_HEALTH
-        ctx[10] = player.damage_taken_this_tick / MAX_HEALTH
+        ctx[9] = agent.damage_dealt_this_tick / MAX_HEALTH
+        ctx[10] = agent.damage_taken_this_tick / MAX_HEALTH
 
-        # Hit accuracy (1) - simplified
-        ctx[11] = min(1.0, player.combo_counter / 5.0)
-
-        # Combo/flags (3)
-        ctx[12] = min(1.0, player.combo_counter / 10.0)
-        ctx[13] = 0.0  # knockback flag
-        ctx[14] = 0.0  # critical flag
+        # Combo (2)
+        ctx[11] = min(1.0, agent.combo_counter / 10.0)
+        ctx[12] = agent.cps / 20.0
 
         # Movement (2)
-        speed = np.sqrt(player.vx**2 + player.vz**2)
-        ctx[15] = speed / SPRINT_SPEED
-        ctx[16] = 0.0  # strafing detection
+        speed = np.sqrt(agent.vx**2 + agent.vz**2)
+        ctx[13] = speed / SPRINT_SPEED if SPRINT_SPEED > 0 else 0.0
+        ctx[14] = 1.0 if agent.on_ground else 0.0
 
-        # Ground + cover (5)
-        ctx[17] = 1.0 if player.on_ground else 0.0
-        # Cover in 4 directions - always 0 in flat arena
-        # ctx[18:22] = 0.0
+        # Block state (2)
+        ctx[15] = 1.0 if agent.is_blocking else 0.0
+        ctx[16] = 1.0 if agent.sprint_reset_ready else 0.0
+
+        # Status effect flags (6)
+        ctx[17] = 1.0 if agent.has_effect("speed") else 0.0
+        ctx[18] = 1.0 if agent.has_effect("regen") else 0.0
+        ctx[19] = 1.0 if agent.has_effect("resistance") else 0.0
+        ctx[20] = 1.0 if agent.has_effect("stun") else 0.0
+        ctx[21] = 1.0 if agent.has_effect("wither") else 0.0
+        ctx[22] = 1.0 if agent.has_effect("slowness") else 0.0
+
+        # Sigil combat state (3)
+        ctx[23] = agent.sigil_damage_amp
+        ctx[24] = agent.sigil_damage_reduction
+        ctx[25] = min(1.0, agent.invuln_hits / 3.0)
 
         return ctx
 
-    def _get_env_state(self) -> np.ndarray:
-        """Build the 8-dim environment state vector."""
+    def _get_env_state(self, agent: Agent = None) -> np.ndarray:
+        """Build 8-dim environment state."""
+        if agent is None:
+            agent = self.player
         env = np.zeros(ENV_STATE_DIM, dtype=np.float32)
 
-        # Distance from center (1)
-        dist_center = np.sqrt(self.player.x**2 + self.player.z**2)
+        dist_center = np.sqrt(agent.x**2 + agent.z**2)
         env[0] = dist_center / ARENA_SIZE
 
-        # Height advantage vs target (1)
-        target = self._get_target()
+        target = self._get_target_for(agent)
         if target and target.is_alive:
-            env[1] = (self.player.y - target.y) / 5.0
-            # Can reach target (1)
-            env[2] = 1.0 if self.physics.distance_between(self.player, target) <= 3.5 else 0.0
-        # Ground quality (1) - always good in flat arena
-        env[3] = 1.0
+            env[1] = (agent.y - target.y) / 5.0
+            env[2] = 1.0 if self.physics.distance_between(agent, target) <= 3.5 else 0.0
+        env[3] = 1.0  # ground quality (flat arena)
 
-        # Obstacles (4) - none in flat arena
-        # env[4:8] = 0.0
+        # Alive counts
+        alive_enemies = sum(1 for e in self.enemies if e.is_alive)
+        alive_allies = sum(1 for a in self.allies if a.is_alive) + (1 if self.player.is_alive else 0)
+        env[4] = alive_enemies / max(self.num_enemies, 1)
+        env[5] = alive_allies / max(self.num_allies + 1, 1)
+
+        # Episode progress
+        env[6] = self.current_tick / self.episode_length
 
         return env
 
     def _get_info(self) -> dict:
-        """Return info dict for logging."""
         alive_enemies = sum(1 for e in self.enemies if e.is_alive)
-        target = self._get_target()
+        target = self._get_target_for(self.player)
         target_dist = self.physics.distance_between(self.player, target) if target else -1.0
 
         return {
@@ -622,23 +749,46 @@ class CombatEnv(gym.Env):
             "kills": self.player.kills,
             "episode_reward": self.episode_reward,
             "target_distance": target_dist,
+            "gaps_remaining": self.player.kit.golden_apples,
+            "pots_remaining": self.player.kit.health_pots,
+            "pearls_remaining": self.player.kit.ender_pearls,
         }
 
-    def get_action_mask(self) -> np.ndarray:
-        """Return a mask of valid actions (1 = valid, 0 = invalid)."""
+    def get_action_mask(self, agent: Agent = None) -> np.ndarray:
+        """Return mask of valid actions (1 = valid, 0 = invalid)."""
+        if agent is None:
+            agent = self.player
         mask = np.ones(NUM_ACTIONS, dtype=np.float32)
 
-        # Mask sigils that are unavailable or on cooldown
-        for i in range(4):
-            bind = self.player.sigil_binds[i]
-            if not bind.available or bind.cooldown_remaining > 0:
-                mask[ACT_SIGIL_0 + i] = 0.0
+        # Kit masking
+        if agent.kit.golden_apples <= 0 or agent.kit.is_eating:
+            mask[ACT_EAT_GAP] = 0.0
+        if agent.kit.health_pots <= 0 or agent.kit.pot_cooldown > 0:
+            mask[ACT_THROW_POT] = 0.0
+        if agent.kit.ender_pearls <= 0 or agent.kit.pearl_cooldown > 0:
+            mask[ACT_THROW_PEARL] = 0.0
 
-        # Can't consume if nothing to consume (v1: nothing)
-        mask[ACT_CONSUME] = 0.0
+        # Sprint reset only if sprinting
+        if not agent.is_sprinting:
+            mask[ACT_SPRINT_RESET] = 0.0
 
-        # Can't switch weapons (v1: only sword)
-        mask[ACT_SWITCH_WEAPON] = 0.0
-        mask[ACT_SWITCH_CONSUMABLE] = 0.0
+        # Block only with sword
+        if agent.weapon != WeaponType.SWORD:
+            mask[ACT_BLOCK] = 0.0
+
+        # Sigil masking
+        sigil_mask = self.physics.sigil_engine.get_ability_mask(agent)
+        for i in range(NUM_SIGIL_SLOTS):
+            mask[ACT_SIGIL_0 + i] = sigil_mask[i]
+
+        # Target masking
+        alive_enemies = len(self._sorted_enemies)
+        for i in range(5):
+            if i >= alive_enemies:
+                mask[ACT_TARGET_0 + i] = 0.0
+
+        # Stun: mask everything
+        if agent.has_effect("stun"):
+            mask[:] = 0.0
 
         return mask
