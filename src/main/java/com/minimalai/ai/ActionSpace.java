@@ -41,11 +41,12 @@ public final class ActionSpace {
     public static final int ACT_SIGIL_10 = 24;
     public static final int ACT_SIGIL_11 = 25;
 
-    // --- Camera (26-29) ---
-    public static final int ACT_LOOK_LEFT  = 26;
-    public static final int ACT_LOOK_RIGHT = 27;
-    public static final int ACT_LOOK_UP    = 28;
-    public static final int ACT_LOOK_DOWN  = 29;
+    // --- Camera intent (26-29) ---
+    // Priority: FACE_TARGET > FACE_AWAY > LOOK_DOWN_SELF > FACE_MOVEMENT
+    public static final int ACT_FACE_TARGET    = 26;  // snap look at combat target
+    public static final int ACT_FACE_AWAY      = 27;  // look opposite of target (kiting)
+    public static final int ACT_LOOK_DOWN_SELF = 28;  // look at feet (self-pot)
+    public static final int ACT_FACE_MOVEMENT  = 29;  // face movement direction
 
     // --- Target selection (30-34, up to 5 nearby entities) ---
     public static final int ACT_TARGET_0 = 30;
@@ -62,8 +63,8 @@ public final class ActionSpace {
     /** Number of target selection slots. */
     public static final int NUM_TARGET_SLOTS = 5;
 
-    /** Camera turn step in degrees per tick when a look action fires. */
-    public static final float CAMERA_STEP_DEGREES = 10f;
+    /** Smoothing factor for look transitions (1.0 = instant snap). */
+    public static final float LOOK_SNAP_FACTOR = 1.0f;
 
     private ActionSpace() {}
 }

@@ -12,6 +12,12 @@ import org.bukkit.World;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
 
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerKickEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -22,8 +28,11 @@ import java.util.logging.Logger;
  * Each bot is a real ServerPlayer injected into the server's player list
  * so that it is visible to all online players, appears in tab, and can
  * interact with the world exactly like a human player.
+ *
+ * Also listens for PlayerKickEvent to prevent plugins (PacketEvents, etc.)
+ * from kicking bot players.
  */
-public class FakePlayerManager {
+public class FakePlayerManager implements Listener {
 
     private final Logger logger;
     private final Map<String, BotContext> activeBots = new ConcurrentHashMap<>();
@@ -93,10 +102,17 @@ public class FakePlayerManager {
 
             // Register the bot with the server's player list.
             // This fires PlayerJoinEvent, adds to tab list, etc.
-            // TODO: placeNewPlayer signature:
-            //       placeNewPlayer(Connection, ServerPlayer, CommonListenerCookie)
-            //       If Paper wraps this differently, adjust the call.
             server.getPlayerList().placeNewPlayer(fakeConn.connection(), bot, cookie);
+
+            // placeNewPlayer creates its own ServerGamePacketListenerImpl,
+            // overwriting our NoOpPacketListener. Swap ours back in so
+            // tick() is no-op'd (prevents keepalive timeout disconnect).
+            fakeConn.reattach(bot);
+
+            // Re-position after placeNewPlayer because plugins like Multiverse
+            // may teleport the bot to a spawn world during the join event.
+            bot.teleportTo(level, location.getX(), location.getY(), location.getZ(),
+                    java.util.Set.of(), location.getYaw(), location.getPitch(), true);
 
             BotContext ctx = new BotContext(name, bot, fakeConn);
             activeBots.put(name, ctx);
@@ -169,6 +185,40 @@ public class FakePlayerManager {
      */
     public int botCount() {
         return activeBots.size();
+    }
+
+    /**
+     * Check if a player name belongs to one of our bots.
+     */
+    public boolean isBot(String name) {
+        return activeBots.containsKey(name);
+    }
+
+    /**
+     * Prevent plugins (PacketEvents, TAB, etc.) from kicking our bots.
+     */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onBotKick(PlayerKickEvent event) {
+        if (isBot(event.getPlayer().getName())) {
+            event.setCancelled(true);
+        }
+    }
+
+    /**
+     * Prevent external plugins (Multiverse, etc.) from teleporting our bots away.
+     * Allows PLUGIN and COMMAND causes so our own code can reposition bots.
+     */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onBotTeleport(PlayerTeleportEvent event) {
+        if (!isBot(event.getPlayer().getName())) return;
+
+        // Allow our own teleports (PLUGIN cause from teleportTo, COMMAND from commands)
+        PlayerTeleportEvent.TeleportCause cause = event.getCause();
+        if (cause == PlayerTeleportEvent.TeleportCause.PLUGIN
+                || cause == PlayerTeleportEvent.TeleportCause.COMMAND) {
+            return; // let it through
+        }
+        event.setCancelled(true);
     }
 
     private static String formatLocation(Location loc) {

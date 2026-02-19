@@ -12,11 +12,14 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
+import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.phys.Vec3;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 import static com.minimalai.ai.ActionSpace.*;
@@ -63,12 +66,19 @@ public class ActionExecutor {
     private static final float WALK_SPEED = 0.1f;
     private static final float SPRINT_SPEED = 0.26f;
 
+    // Vanilla melee reach and max angle for hit registration
+    private static final double MELEE_REACH = 3.0;
+    private static final double MELEE_ANGLE_COS = Math.cos(Math.toRadians(60)); // ~60° cone
+
     private final @Nullable ArcaneSigilsAPI sigilsApi;
     private final @Nullable SigilCooldownQuery sigilCooldowns;
 
-    // Eating state: golden apple takes 32 ticks to consume
-    private int eatingTicksRemaining = 0;
-    private InteractionHand eatingHand = null;
+    // Per-bot eating state (keyed by entity ID since ActionExecutor is shared)
+    private static class EatingState {
+        int ticksRemaining = 0;
+        InteractionHand hand = null;
+    }
+    private final Map<Integer, EatingState> eatingStates = new ConcurrentHashMap<>();
 
     /**
      * @param sigilsApi      nullable; set if ArcaneSigils is loaded
@@ -111,6 +121,8 @@ public class ActionExecutor {
         applySneak(bot, actions);
         applySprint(bot, actions);
         applySprintReset(bot, actions);
+        // Look BEFORE attack so the bot faces the target first
+        applyLookIntent(bot, actions, target);
         applyAttack(bot, actions, target);
         applyBlock(bot, actions);
         applyEatGap(bot, actions);
@@ -118,7 +130,6 @@ public class ActionExecutor {
         applyThrowPearl(bot, actions);
         // ACT_SWAP_WEAPON (13) is always masked -- no-op
         applySigils(bot, actions);
-        applyLook(bot, actions);
 
         tickEating(bot);
 
@@ -136,7 +147,9 @@ public class ActionExecutor {
         if (forward == 0 && strafe == 0) {
             // No movement input -- keep vertical momentum, zero horizontal
             Vec3 current = bot.getDeltaMovement();
-            bot.setDeltaMovement(0, current.y, 0);
+            Vec3 verticalOnly = new Vec3(0, current.y, 0);
+            bot.setDeltaMovement(verticalOnly);
+            bot.move(MoverType.SELF, verticalOnly);
             return;
         }
 
@@ -147,7 +160,11 @@ public class ActionExecutor {
         double dz = (Math.cos(yawRad) * forward + Math.sin(yawRad) * strafe) * speed;
 
         Vec3 current = bot.getDeltaMovement();
-        bot.setDeltaMovement(dx, current.y, dz);
+        Vec3 movement = new Vec3(dx, current.y, dz);
+        bot.setDeltaMovement(movement);
+        // ServerPlayer movement is packet-driven; setDeltaMovement alone won't
+        // change position. Explicitly apply the displacement with collision.
+        bot.move(MoverType.SELF, movement);
     }
 
     // ------------------------------------------------------------------
@@ -193,9 +210,25 @@ public class ActionExecutor {
 
     private void applyAttack(ServerPlayer bot, int[] actions,
                              @Nullable LivingEntity target) {
-        if (actions[ACT_ATTACK] == 1 && target != null && target.isAlive()) {
-            bot.attack(target); // vanilla damage calc, knockback, crits
+        if (actions[ACT_ATTACK] != 1 || target == null || !target.isAlive()) return;
+
+        // Range check: vanilla player reach is ~3 blocks
+        double dist = bot.distanceTo(target);
+        if (dist > MELEE_REACH) return;
+
+        // Angle check: bot must be roughly facing the target
+        double dx = target.getX() - bot.getX();
+        double dz = target.getZ() - bot.getZ();
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        if (horizDist > 0.01) {
+            float yawRad = (float) Math.toRadians(bot.getYRot());
+            double lookX = -Math.sin(yawRad);
+            double lookZ = Math.cos(yawRad);
+            double dot = (lookX * dx + lookZ * dz) / horizDist;
+            if (dot < MELEE_ANGLE_COS) return; // target is outside the ~60° cone
         }
+
+        bot.attack(target); // vanilla damage calc, knockback, crits
     }
 
     // ------------------------------------------------------------------
@@ -229,7 +262,8 @@ public class ActionExecutor {
 
     private void applyEatGap(ServerPlayer bot, int[] actions) {
         if (actions[ACT_EAT_GAP] != 1) return;
-        if (eatingTicksRemaining > 0) return; // already eating
+        EatingState es = eatingStates.computeIfAbsent(bot.getId(), k -> new EatingState());
+        if (es.ticksRemaining > 0) return; // already eating
 
         // Find a golden apple in inventory
         int slot = findItemSlot(bot, stack ->
@@ -239,18 +273,19 @@ public class ActionExecutor {
         // Move the apple to main hand and start using
         swapToSlot(bot, slot);
         bot.startUsingItem(InteractionHand.MAIN_HAND);
-        eatingTicksRemaining = 32; // golden apple use time
-        eatingHand = InteractionHand.MAIN_HAND;
+        es.ticksRemaining = 32; // golden apple use time
+        es.hand = InteractionHand.MAIN_HAND;
     }
 
     /** Tick down eating state; stop using when done. */
     private void tickEating(ServerPlayer bot) {
-        if (eatingTicksRemaining <= 0) return;
-        eatingTicksRemaining--;
-        if (eatingTicksRemaining == 0) {
+        EatingState es = eatingStates.get(bot.getId());
+        if (es == null || es.ticksRemaining <= 0) return;
+        es.ticksRemaining--;
+        if (es.ticksRemaining == 0) {
             // Let vanilla finish the use (completeUsingItem is called automatically
             // by the server when useItemRemainingTicks reaches 0).
-            eatingHand = null;
+            es.hand = null;
         }
     }
 
@@ -307,6 +342,9 @@ public class ActionExecutor {
 
         level.addFreshEntity(pearl);
 
+        // Apply vanilla pearl cooldown (20 ticks = 1 second)
+        bot.getCooldowns().addCooldown(pearlStack, 20);
+
         // Consume the item
         pearlStack.shrink(1);
         if (pearlStack.isEmpty()) {
@@ -332,25 +370,55 @@ public class ActionExecutor {
     }
 
     // ------------------------------------------------------------------
-    //  Camera / Look (actions 26-29)
+    //  Camera intent (actions 26-29)
+    //  Priority: FACE_TARGET > FACE_AWAY > LOOK_DOWN_SELF > FACE_MOVEMENT
     // ------------------------------------------------------------------
 
-    private void applyLook(ServerPlayer bot, int[] actions) {
-        float yawDelta = 0f;
-        float pitchDelta = 0f;
-
-        if (actions[ACT_LOOK_LEFT] == 1)  yawDelta  -= CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_RIGHT] == 1) yawDelta  += CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_UP] == 1)    pitchDelta -= CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_DOWN] == 1)  pitchDelta += CAMERA_STEP_DEGREES;
-
-        if (yawDelta != 0f || pitchDelta != 0f) {
-            float newYaw = bot.getYRot() + yawDelta;
-            float newPitch = Math.clamp(bot.getXRot() + pitchDelta, -90f, 90f);
-            bot.setYRot(newYaw);
-            bot.setXRot(newPitch);
-            bot.setYHeadRot(newYaw);
+    private void applyLookIntent(ServerPlayer bot, int[] actions,
+                                  @Nullable LivingEntity target) {
+        if (actions[ACT_FACE_TARGET] == 1 && target != null && target.isAlive()) {
+            lookAt(bot, target.getX(), target.getEyeY(), target.getZ());
+        } else if (actions[ACT_FACE_AWAY] == 1 && target != null && target.isAlive()) {
+            // Look directly opposite of target
+            float yawToTarget = getYawToward(bot, target.getX(), target.getZ());
+            bot.setYRot(yawToTarget + 180f);
+            bot.setXRot(0f); // level pitch for running
+            bot.setYHeadRot(bot.getYRot());
+        } else if (actions[ACT_LOOK_DOWN_SELF] == 1) {
+            // Look at own feet for self-potting
+            bot.setXRot(89f);
+            bot.setYHeadRot(bot.getYRot());
+        } else if (actions[ACT_FACE_MOVEMENT] == 1) {
+            // Face movement direction
+            Vec3 vel = bot.getDeltaMovement();
+            if (vel.x * vel.x + vel.z * vel.z > 0.001) {
+                float moveYaw = (float) (Math.toDegrees(Math.atan2(-vel.x, vel.z)));
+                bot.setYRot(moveYaw);
+                bot.setXRot(0f);
+                bot.setYHeadRot(moveYaw);
+            }
         }
+        // If no intent is active, hold current look direction
+    }
+
+    private void lookAt(ServerPlayer bot, double x, double y, double z) {
+        double dx = x - bot.getX();
+        double dy = y - bot.getEyeY();
+        double dz = z - bot.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, dist));
+
+        bot.setYRot(yaw);
+        bot.setXRot(Math.clamp(pitch, -90f, 90f));
+        bot.setYHeadRot(yaw);
+    }
+
+    private float getYawToward(ServerPlayer bot, double x, double z) {
+        double dx = x - bot.getX();
+        double dz = z - bot.getZ();
+        return (float) Math.toDegrees(Math.atan2(-dx, dz));
     }
 
     // ------------------------------------------------------------------
@@ -385,7 +453,7 @@ public class ActionExecutor {
     public float[] buildActionMask(ServerPlayer bot) {
         float[] mask = new float[NUM_ACTIONS];
 
-        // Movement, sprint, sneak, look, sprint-reset are always valid
+        // Movement, sprint, sneak, look intents, sprint-reset are always valid
         mask[ACT_FORWARD] = 1f;
         mask[ACT_BACKWARD] = 1f;
         mask[ACT_STRAFE_LEFT] = 1f;
@@ -394,10 +462,10 @@ public class ActionExecutor {
         mask[ACT_SPRINT] = 1f;
         mask[ACT_SPRINT_RESET] = 1f;
 
-        mask[ACT_LOOK_LEFT] = 1f;
-        mask[ACT_LOOK_RIGHT] = 1f;
-        mask[ACT_LOOK_UP] = 1f;
-        mask[ACT_LOOK_DOWN] = 1f;
+        mask[ACT_FACE_TARGET] = 1f;
+        mask[ACT_FACE_AWAY] = 1f;
+        mask[ACT_LOOK_DOWN_SELF] = 1f;
+        mask[ACT_FACE_MOVEMENT] = 1f;
 
         // Jump: only if on ground
         mask[ACT_JUMP] = bot.onGround() ? 1f : 0f;
@@ -418,8 +486,10 @@ public class ActionExecutor {
         mask[ACT_THROW_POT] = hasItem(bot, stack ->
                 stack.is(Items.SPLASH_POTION) && isHealingPotion(stack)) ? 1f : 0f;
 
-        // Throw ender pearl
-        mask[ACT_THROW_PEARL] = hasItem(bot, stack -> stack.is(Items.ENDER_PEARL)) ? 1f : 0f;
+        // Throw ender pearl (must have item AND not on cooldown)
+        boolean hasPearl = hasItem(bot, stack -> stack.is(Items.ENDER_PEARL));
+        boolean pearlOnCooldown = bot.getCooldowns().isOnCooldown(new ItemStack(Items.ENDER_PEARL));
+        mask[ACT_THROW_PEARL] = (hasPearl && !pearlOnCooldown) ? 1f : 0f;
 
         // Swap weapon: always masked
         mask[ACT_SWAP_WEAPON] = 0f;
@@ -561,7 +631,7 @@ public class ActionExecutor {
             "SPRINT_RESET", "SWAP_WPN",
             "SIG0", "SIG1", "SIG2", "SIG3", "SIG4", "SIG5",
             "SIG6", "SIG7", "SIG8", "SIG9", "SIG10", "SIG11",
-            "LOOK_L", "LOOK_R", "LOOK_UP", "LOOK_DN",
+            "FACE_TGT", "FACE_AWAY", "LOOK_DN_SELF", "FACE_MOVE",
             "TGT0", "TGT1", "TGT2", "TGT3", "TGT4"
         };
         StringBuilder sb = new StringBuilder();

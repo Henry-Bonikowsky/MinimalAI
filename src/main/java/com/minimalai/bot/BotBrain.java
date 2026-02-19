@@ -6,14 +6,14 @@ import ai.djl.ndarray.NDManager;
 import com.minimalai.ai.*;
 import com.minimalai.integration.ArcaneSigilsAPI;
 import com.minimalai.training.ExperienceBuffer;
+import com.minimalai.training.PhysicsRecorder;
 import com.minimalai.training.RewardComputer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.AABB;
 import org.jetbrains.annotations.Nullable;
 
-import java.util.Comparator;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.logging.Logger;
 
@@ -47,6 +47,39 @@ public class BotBrain {
     private @Nullable RewardComputer rewardComputer;
     private boolean trainingEnabled = false;
 
+    // Self-play: pause ticking when "dead", ally UUIDs to avoid targeting teammates
+    private boolean paused = false;
+    private Set<UUID> allyUUIDs = Set.of();
+
+    // Physics recording mode (random actions, no model needed)
+    private @Nullable PhysicsRecorder physicsRecorder;
+    private boolean recordingMode = false;
+
+    // Random action probabilities for recording mode
+    private static final float[] RANDOM_PROBS = {
+        0.6f,  // forward (biased toward moving)
+        0.1f,  // backward
+        0.2f,  // strafe left
+        0.2f,  // strafe right
+        0.15f, // jump
+        0.05f, // sneak
+        0.4f,  // sprint (biased toward sprinting)
+        0.3f,  // attack
+        0.05f, // block
+        0.02f, // eat gap
+        0.02f, // throw pot
+        0.02f, // throw pearl
+        0.1f,  // sprint reset
+        0.0f,  // swap weapon (always masked)
+        0.02f, 0.02f, 0.02f, 0.02f, 0.02f, 0.02f, // sigils 0-5
+        0.02f, 0.02f, 0.02f, 0.02f, 0.02f, 0.02f, // sigils 6-11
+        0.5f,  // face target
+        0.1f,  // face away
+        0.05f, // look down self
+        0.2f,  // face movement
+        0.1f, 0.05f, 0.03f, 0.02f, 0.01f // target selection 0-4
+    };
+
     public BotBrain(String name,
                     ServerPlayer bot,
                     ModelManager modelManager,
@@ -66,13 +99,32 @@ public class BotBrain {
 
     /**
      * Execute one tick of the bot's brain: observe → infer → act.
+     * In recording mode, uses random actions and logs physics data.
      * Called from the server tick scheduler.
      */
     public void tick() {
+        if (paused) return;
+
+        // Recording mode: random actions + physics logging, no model needed
+        if (recordingMode && physicsRecorder != null) {
+            tickRecording();
+            return;
+        }
+
+        // Advance per-tick observation state (combat accumulators, tick counter)
+        obsBuilder.onTick(name);
+
         try {
             // Find nearest target if we don't have one or it's dead
             if (target == null || !target.isAlive()) {
                 target = findNearestEnemy();
+            }
+
+            // No enemies nearby — stand still, don't run inference
+            if (target == null) {
+                bot.setDeltaMovement(0, bot.getDeltaMovement().y, 0);
+                bot.setSprinting(false);
+                return;
             }
 
             // 1. Build observations
@@ -80,6 +132,8 @@ public class BotBrain {
             ObservationBuilder.Observation obs = obsBuilder.build(bot, targetPlayer);
 
             // 2. Run model inference
+            // Save pre-inference hidden state for experience recording
+            float[] preHidden = hidden.clone();
             ModelManager.InferenceResult result = modelManager.infer(
                     predictor, ndManager,
                     obs.selfState(),
@@ -124,7 +178,7 @@ public class BotBrain {
                         result.value,
                         reward,
                         done,
-                        hidden
+                        preHidden // use pre-inference hidden, not post-update
                 ));
             }
 
@@ -163,7 +217,13 @@ public class BotBrain {
      */
     private @Nullable LivingEntity findNearestEnemy() {
         List<LivingEntity> nearby = getNearbyEntities();
-        return nearby.isEmpty() ? null : nearby.get(0);
+        // Filter out allies — they're visible in observations but not valid targets
+        for (LivingEntity e : nearby) {
+            if (!allyUUIDs.contains(e.getUUID())) {
+                return e;
+            }
+        }
+        return null;
     }
 
     /**
@@ -207,8 +267,85 @@ public class BotBrain {
         return target;
     }
 
+    public void setTarget(@Nullable LivingEntity target) {
+        this.target = target;
+    }
+
+    public void setPaused(boolean paused) {
+        this.paused = paused;
+    }
+
+    public boolean isPaused() {
+        return paused;
+    }
+
+    public void setAllies(Set<UUID> allies) {
+        this.allyUUIDs = allies;
+    }
+
+    // ----------------------------------------------------------------
+    //  Physics recording mode
+    // ----------------------------------------------------------------
+
+    /**
+     * Enable recording mode: random actions, no model inference, logs physics.
+     */
+    public void setRecordingMode(PhysicsRecorder recorder) {
+        this.physicsRecorder = recorder;
+        this.recordingMode = true;
+    }
+
+    public boolean isRecordingMode() {
+        return recordingMode;
+    }
+
+    public @Nullable PhysicsRecorder getPhysicsRecorder() {
+        return physicsRecorder;
+    }
+
+    /**
+     * Recording tick: random actions + physics data logging.
+     * No model inference needed — actions are sampled from fixed probabilities.
+     */
+    private void tickRecording() {
+        try {
+            // Find target for combat recording
+            if (target == null || !target.isAlive()) {
+                target = findNearestEnemy();
+            }
+
+            // Capture pre-action state
+            PhysicsRecorder.StateSnapshot pre = PhysicsRecorder.StateSnapshot.capture(bot);
+
+            // Build action mask
+            List<LivingEntity> nearby = getNearbyEntities();
+            float[] actionMask = actionExecutor.buildActionMask(bot, nearby.size());
+
+            // Sample random actions from fixed probabilities with mask
+            int[] actions = sampleActions(RANDOM_PROBS, actionMask);
+
+            // Execute actions
+            LivingEntity newTarget = actionExecutor.execute(bot, actions, target, nearby);
+            if (newTarget != null) {
+                target = newTarget;
+            }
+
+            // Capture post-action state
+            PhysicsRecorder.StateSnapshot post = PhysicsRecorder.StateSnapshot.capture(bot);
+
+            // Record the tick
+            physicsRecorder.record(name, pre, post, actions, target, bot);
+
+        } catch (Exception e) {
+            LOG.warning("Recording tick error for '" + name + "': " + e.getMessage());
+        }
+    }
+
     public void close() {
         try {
+            if (physicsRecorder != null) {
+                physicsRecorder.close();
+            }
             predictor.close();
             ndManager.close();
         } catch (Exception e) {

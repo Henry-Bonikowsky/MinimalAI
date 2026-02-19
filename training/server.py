@@ -245,7 +245,9 @@ class TrainingServer:
     def deserialize_experiences(self, data: bytes) -> list:
         """Parse binary experience data from Java.
 
-        Format per experience (big-endian):
+        Wire format (big-endian):
+            int32      numExperiences   (4-byte header)
+            -- per experience --
             float[38]  selfState
             float[192] entityFeatures  (8 * 24 flattened)
             float[8]   entityMask
@@ -262,22 +264,24 @@ class TrainingServer:
         Returns:
             List of dicts, each with numpy arrays for the experience fields.
         """
-        if len(data) < EXPERIENCE_SIZE:
-            logging.warning(
-                f"Experience data too short: {len(data)} bytes "
-                f"(expected at least {EXPERIENCE_SIZE})"
-            )
+        if len(data) < 4:
+            logging.warning(f"Experience data too short: {len(data)} bytes (need at least 4 for header)")
             return []
 
-        num_experiences = len(data) // EXPERIENCE_SIZE
-        if len(data) % EXPERIENCE_SIZE != 0:
+        # Read numExperiences header (written by ExperienceBuffer.toSerializable())
+        num_experiences = struct.unpack_from(">i", data, 0)[0]
+        offset = 4
+
+        expected_size = 4 + num_experiences * EXPERIENCE_SIZE
+        if len(data) < expected_size:
             logging.warning(
-                f"Experience data length {len(data)} is not a multiple of "
-                f"experience size {EXPERIENCE_SIZE}; truncating"
+                f"Experience data too short: {len(data)} bytes "
+                f"(expected {expected_size} for {num_experiences} experiences)"
             )
+            # Clamp to what we can actually read
+            num_experiences = (len(data) - 4) // EXPERIENCE_SIZE
 
         experiences = []
-        offset = 0
 
         for _ in range(num_experiences):
             # self_state: float[38]

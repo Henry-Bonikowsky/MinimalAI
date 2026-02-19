@@ -90,15 +90,22 @@ public class EpisodeManager {
      * Start (or restart) an episode for the given bot.
      */
     public void startEpisode(String botName) {
+        startEpisode(botName, maxEpisodeTicks);
+    }
+
+    /**
+     * Start (or restart) an episode with a custom tick limit.
+     */
+    public void startEpisode(String botName, int customMaxTicks) {
         int nextNumber = 1;
         EpisodeState prev = episodes.get(botName);
         if (prev != null) {
             nextNumber = prev.episodeNumber + 1;
         }
 
-        EpisodeState state = new EpisodeState(nextNumber, maxEpisodeTicks);
+        EpisodeState state = new EpisodeState(nextNumber, customMaxTicks);
         episodes.put(botName, state);
-        LOG.info("[EpisodeManager] Episode " + nextNumber + " started for " + botName);
+        LOG.info("[EpisodeManager] Episode " + nextNumber + " started for " + botName + " (maxTicks=" + customMaxTicks + ")");
     }
 
     /**

@@ -1,6 +1,10 @@
 package com.minimalai.bot;
 
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import net.minecraft.network.Connection;
 import net.minecraft.network.PacketSendListener;
@@ -16,10 +20,9 @@ import java.net.InetSocketAddress;
 /**
  * No-op network plumbing for fake (bot) players.
  *
- * The server requires every ServerPlayer to have a valid Connection and
- * packet listener so it doesn't NPE when broadcasting packets.  We give
- * it an EmbeddedChannel (Netty in-memory) and a listener that silently
- * drops every outbound packet.
+ * Adds dummy pipeline handlers ("encoder", "decoder", "splitter", "prepender")
+ * so plugins like ProtocolLib, TAB, and ModelEngine don't crash when they
+ * try to inject into or write through the pipeline.
  */
 public class FakeConnection {
 
@@ -31,51 +34,46 @@ public class FakeConnection {
         this.packetListener = packetListener;
     }
 
-    /**
-     * Build a fully wired FakeConnection for the given bot player.
-     *
-     * @param server the dedicated server instance
-     * @param player the fake ServerPlayer that needs networking
-     * @param cookie the CommonListenerCookie used during login
-     * @return a FakeConnection whose {@link #connection()} can be passed to placeNewPlayer
-     */
     public static FakeConnection create(MinecraftServer server, ServerPlayer player, CommonListenerCookie cookie) {
-        // 1. Create a Connection backed by an in-memory Netty channel.
-        //    PacketFlow.SERVERBOUND means "we receive from client" which is
-        //    the perspective the server expects for an incoming connection.
         Connection connection = new Connection(PacketFlow.SERVERBOUND);
 
-        // 2. Attach an EmbeddedChannel so Netty internals don't NPE.
-        //    EmbeddedChannel is a fully functional in-memory channel.
-        Channel channel = new EmbeddedChannel();
+        EmbeddedChannel channel = new EmbeddedChannel();
+
+        // Add dummy named handlers that plugins expect to find in the pipeline.
+        // ProtocolLib/PacketEvents inject "before encoder" / "after decoder" — without
+        // these named handlers they throw NoSuchElementException.
+        channel.pipeline().addLast("splitter", new ChannelInboundHandlerAdapter());
+        channel.pipeline().addLast("decoder", new ChannelInboundHandlerAdapter());
+        channel.pipeline().addLast("prepender", new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                promise.setSuccess();
+            }
+        });
+        channel.pipeline().addLast("encoder", new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                promise.setSuccess();
+            }
+        });
+        channel.pipeline().addLast("packet_handler", connection);
+
         connection.channel = channel;
-        // Give it a remote address so logging / anti-cheat doesn't explode
         connection.address = new InetSocketAddress("127.0.0.1", 0);
 
-        // TODO: In some Paper builds connection.channel is private/final.
-        //       If direct field assignment fails, use reflection:
-        //
-        //   Field channelField = Connection.class.getDeclaredField("channel");
-        //   channelField.setAccessible(true);
-        //   channelField.set(connection, channel);
-        //
-        //   Field addressField = Connection.class.getDeclaredField("address");
-        //   addressField.setAccessible(true);
-        //   addressField.set(connection, new InetSocketAddress("127.0.0.1", 0));
-
-        // 3. Build the packet listener.
-        //    ServerGamePacketListenerImpl is the main in-game packet handler.
-        //    We override send() to no-op so outbound packets are silently dropped.
-        //
-        // TODO: The ServerGamePacketListenerImpl constructor signature may vary
-        //       across Paper versions. Typical 1.21.x signature:
-        //       (MinecraftServer, Connection, ServerPlayer, CommonListenerCookie)
         ServerGamePacketListenerImpl listener = new NoOpPacketListener(server, connection, player, cookie);
-
-        // Wire the listener onto the connection
         player.connection = listener;
 
         return new FakeConnection(connection, listener);
+    }
+
+    /**
+     * Reassign the NoOpPacketListener onto the player AFTER placeNewPlayer().
+     * placeNewPlayer creates its own ServerGamePacketListenerImpl and overwrites ours,
+     * which causes keepalive timeouts. This swaps ours back in.
+     */
+    public void reattach(ServerPlayer player) {
+        player.connection = packetListener;
     }
 
     public Connection connection() {
@@ -86,14 +84,8 @@ public class FakeConnection {
         return packetListener;
     }
 
-    /**
-     * Packet listener that drops all outbound traffic.
-     * Keeps the bot "connected" without generating network I/O.
-     */
     private static class NoOpPacketListener extends ServerGamePacketListenerImpl {
 
-        // TODO: Verify this constructor matches your Paper 1.21.10 build.
-        //       If Paper adds/removes parameters, adjust here.
         public NoOpPacketListener(MinecraftServer server, Connection connection,
                                   ServerPlayer player, CommonListenerCookie cookie) {
             super(server, connection, player, cookie);
@@ -101,24 +93,13 @@ public class FakeConnection {
 
         @Override
         public void send(Packet<?> packet) {
-            // Silently drop -- no real client to receive this
-        }
-
-        // send(Packet, PacketSendListener) may not exist in all Paper builds.
-        // If it does, uncomment this @Override.
-        public void send(Packet<?> packet, PacketSendListener listener) {
             // Silently drop
         }
 
-        // TODO: If the server kicks bots for "timed out", override the
-        //       tick/keepalive methods to no-op as well:
-        //
-        //   @Override
-        //   public void handleKeepAlive(ServerboundKeepAlivePacket pkt) { }
-        //
-        //   @Override
-        //   public void tick() {
-        //       // Call super.tick() but catch/suppress timeout disconnect
-        //   }
+        // Overload for packets with send listener (silently drop)
+        public void send(Packet<?> packet, PacketSendListener listener) {
+            // Silently drop — the channel encoder no-ops already handle this,
+            // but this catches any direct calls with a PacketSendListener arg.
+        }
     }
 }

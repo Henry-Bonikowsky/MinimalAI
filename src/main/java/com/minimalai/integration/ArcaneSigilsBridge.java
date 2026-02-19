@@ -4,9 +4,6 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
-import org.bukkit.scoreboard.Objective;
-import org.bukkit.scoreboard.Score;
-import org.bukkit.scoreboard.Scoreboard;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
@@ -14,21 +11,37 @@ import java.util.List;
 import java.util.logging.Logger;
 
 /**
- * Bridge to ArcaneSigils plugin.
+ * Bridge to ArcaneSigils plugin via reflection against its real Java API.
  *
- * Strategy: Try direct API via reflection (ArcaneSigils.getAPI()), fall back
- * to scoreboard queries, fall back to command dispatch.
- *
- * Once ArcaneSigils exposes its API jar as a compileOnly dependency,
- * the reflection can be replaced with direct calls.
+ * Uses ArmorSetsPlugin.getAPI() to get the native ArcaneSigilsAPI instance,
+ * then forwards all calls via cached reflection Method handles.
  */
 public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
 
-    private static final int MAX_SLOTS = 12;
-
     private final Logger logger;
     private final boolean pluginPresent;
-    private Object nativeApi; // com.miracle.arcanesigils.api.ArcaneSigilsAPI via reflection
+    private Object nativeApi; // com.miracle.arcanesigils.api.ArcaneSigilsAPI
+
+    // Cached method handles for hot-path calls
+    private Method mIsSigilReady;
+    private Method mGetCooldownProgress;
+    private Method mGetCooldownRemaining;
+    private Method mGetMaxCooldown;
+    private Method mGetTier;
+    private Method mGetSigilType;
+    private Method mGetActivationType;
+    private Method mActivateAbility;
+    private Method mGetDamageAmplifier;
+    private Method mGetDamageReduction;
+    private Method mGetKingsBraceCharges;
+    private Method mGetInvulnHits;
+    private Method mIsMarked;
+    private Method mHasMark;
+    private Method mGetActiveMarks;
+    private Method mGetMarkDamageMultiplier;
+    private Method mGetSelectedTarget;
+    private Method mGetLastVictim;
+    private Method mGetEquippedSigils;
 
     public ArcaneSigilsBridge(Logger logger) {
         this.logger = logger;
@@ -36,163 +49,240 @@ public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
         this.pluginPresent = sigils != null && sigils.isEnabled();
 
         if (pluginPresent) {
-            // Try to get native API via reflection
             try {
+                // ArmorSetsPlugin.getAPI() is static
                 Method getApi = sigils.getClass().getMethod("getAPI");
                 nativeApi = getApi.invoke(null);
-                logger.info("ArcaneSigils API connected directly");
+                if (nativeApi != null) {
+                    cacheMethodHandles(nativeApi.getClass());
+                    logger.info("ArcaneSigils API connected via reflection");
+                } else {
+                    logger.warning("ArcaneSigils getAPI() returned null");
+                }
             } catch (Exception e) {
                 nativeApi = null;
-                logger.info("ArcaneSigils detected - using scoreboard fallback");
+                logger.warning("Failed to connect ArcaneSigils API: " + e.getMessage());
             }
         } else {
             logger.info("ArcaneSigils not found - sigil features disabled");
         }
     }
 
+    private void cacheMethodHandles(Class<?> apiClass) {
+        try {
+            mIsSigilReady = apiClass.getMethod("isSigilReady", Player.class, int.class);
+            mGetCooldownProgress = apiClass.getMethod("getCooldownProgress", Player.class, int.class);
+            mGetCooldownRemaining = apiClass.getMethod("getCooldownRemaining", Player.class, int.class);
+            mGetMaxCooldown = apiClass.getMethod("getMaxCooldown", Player.class, int.class);
+            mGetTier = apiClass.getMethod("getTier", Player.class, int.class);
+            mGetSigilType = apiClass.getMethod("getSigilType", Player.class, int.class);
+            mGetActivationType = apiClass.getMethod("getActivationType", Player.class, int.class);
+            mActivateAbility = apiClass.getMethod("activateAbility", Player.class, int.class);
+            mGetDamageAmplifier = apiClass.getMethod("getDamageAmplifier", Player.class);
+            mGetDamageReduction = apiClass.getMethod("getDamageReduction", Player.class);
+            mGetKingsBraceCharges = apiClass.getMethod("getKingsBraceCharges", Player.class);
+            mGetInvulnHits = apiClass.getMethod("getInvulnHits", Player.class);
+            mIsMarked = apiClass.getMethod("isMarked", Player.class, Player.class);
+            mHasMark = apiClass.getMethod("hasMark", LivingEntity.class, String.class);
+            mGetActiveMarks = apiClass.getMethod("getActiveMarks", LivingEntity.class);
+            mGetMarkDamageMultiplier = apiClass.getMethod("getMarkDamageMultiplier", LivingEntity.class);
+            mGetSelectedTarget = apiClass.getMethod("getSelectedTarget", Player.class);
+            mGetLastVictim = apiClass.getMethod("getLastVictim", Player.class);
+            mGetEquippedSigils = apiClass.getMethod("getEquippedSigils", Player.class);
+        } catch (NoSuchMethodException e) {
+            logger.warning("ArcaneSigils API method not found: " + e.getMessage());
+            nativeApi = null;
+        }
+    }
+
     @Override
     public boolean isAvailable() {
-        return pluginPresent;
+        return pluginPresent && nativeApi != null;
     }
 
     @Override
     public List<SigilInfo> getEquippedSigils(Player player) {
-        if (!pluginPresent) return Collections.emptyList();
-        // TODO: Implement via native API or scoreboard
+        if (!isAvailable()) return Collections.emptyList();
+        // TODO: Map native SigilInfo records to our SigilInfo records
         return Collections.emptyList();
     }
 
     @Override
     public boolean isSigilReady(Player player, int bindSlot) {
-        if (!pluginPresent) return false;
-        return getScoreboardValue(player, "as_sigil_" + bindSlot + "_ready") == 1;
+        if (!isAvailable()) return false;
+        try {
+            return (boolean) mIsSigilReady.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
     public double getCooldownProgress(Player player, int bindSlot) {
-        if (!pluginPresent) return 0.0;
-        return getScoreboardValue(player, "as_sigil_" + bindSlot + "_cd") / 100.0;
+        if (!isAvailable()) return 0.0;
+        try {
+            return (double) mGetCooldownProgress.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     @Override
     public double getCooldownRemaining(Player player, int bindSlot) {
-        if (!pluginPresent) return 0.0;
-        return getScoreboardValue(player, "as_sigil_" + bindSlot + "_cd_rem") / 20.0;
+        if (!isAvailable()) return 0.0;
+        try {
+            return (double) mGetCooldownRemaining.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     @Override
     public double getMaxCooldown(Player player, int bindSlot) {
-        if (!pluginPresent) return 0.0;
-        return getScoreboardValue(player, "as_sigil_" + bindSlot + "_cd_max") / 20.0;
+        if (!isAvailable()) return 0.0;
+        try {
+            return (double) mGetMaxCooldown.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     @Override
     public int getTier(Player player, int bindSlot) {
-        if (!pluginPresent) return 0;
-        return getScoreboardValue(player, "as_sigil_" + bindSlot + "_tier");
+        if (!isAvailable()) return 0;
+        try {
+            return (int) mGetTier.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     @Override
     public String getSigilType(Player player, int bindSlot) {
-        if (!pluginPresent) return "empty";
-        // TODO: Map from scoreboard int code to string ID once ArcaneSigils exposes this
-        return "unknown";
+        if (!isAvailable()) return "empty";
+        try {
+            return (String) mGetSigilType.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return "empty";
+        }
     }
 
     @Override
     public String getActivationType(Player player, int bindSlot) {
-        if (!pluginPresent) return "passive";
-        return "ability"; // TODO: Read from API/scoreboard
+        if (!isAvailable()) return "passive";
+        try {
+            return (String) mGetActivationType.invoke(nativeApi, player, bindSlot);
+        } catch (Exception e) {
+            return "passive";
+        }
     }
 
     @Override
     public boolean activateAbility(Player player, int bindSlot) {
-        if (!pluginPresent) return false;
-        if (!isSigilReady(player, bindSlot)) return false;
+        if (!isAvailable()) return false;
         try {
-            return Bukkit.dispatchCommand(Bukkit.getConsoleSender(),
-                    "arcanesigils activate " + player.getName() + " " + bindSlot);
+            return (boolean) mActivateAbility.invoke(nativeApi, player, bindSlot);
         } catch (Exception e) {
-            logger.warning("Failed to dispatch sigil activation: " + e.getMessage());
+            logger.warning("Failed to activate sigil ability: " + e.getMessage());
             return false;
         }
     }
 
     @Override
     public double getDamageAmplifier(Player player) {
-        if (!pluginPresent) return 1.0;
-        int raw = getScoreboardValue(player, "as_dmg_amp");
-        return raw == 0 ? 1.0 : raw / 100.0;
+        if (!isAvailable()) return 1.0;
+        try {
+            return (double) mGetDamageAmplifier.invoke(nativeApi, player);
+        } catch (Exception e) {
+            return 1.0;
+        }
     }
 
     @Override
     public double getDamageReduction(Player player) {
-        if (!pluginPresent) return 1.0;
-        int raw = getScoreboardValue(player, "as_dmg_red");
-        return raw == 0 ? 1.0 : raw / 100.0;
+        if (!isAvailable()) return 1.0;
+        try {
+            return (double) mGetDamageReduction.invoke(nativeApi, player);
+        } catch (Exception e) {
+            return 1.0;
+        }
     }
 
     @Override
     public int getKingsBraceCharges(Player player) {
-        if (!pluginPresent) return 0;
-        return getScoreboardValue(player, "as_kb_charges");
+        if (!isAvailable()) return 0;
+        try {
+            return (int) mGetKingsBraceCharges.invoke(nativeApi, player);
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     @Override
     public int getInvulnHits(Player player) {
-        if (!pluginPresent) return 0;
-        return getScoreboardValue(player, "as_invuln");
+        if (!isAvailable()) return 0;
+        try {
+            return (int) mGetInvulnHits.invoke(nativeApi, player);
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     @Override
     public boolean isMarked(Player target, Player attacker) {
-        if (!pluginPresent) return false;
-        return getScoreboardValue(target, "as_marked_by_" + attacker.getName()) > 0;
+        if (!isAvailable()) return false;
+        try {
+            return (boolean) mIsMarked.invoke(nativeApi, target, attacker);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
     public boolean hasMark(LivingEntity entity, String markName) {
-        if (!pluginPresent) return false;
-        if (!(entity instanceof Player p)) return false;
-        return getScoreboardValue(p, "as_mark_" + markName.toLowerCase()) > 0;
+        if (!isAvailable()) return false;
+        try {
+            return (boolean) mHasMark.invoke(nativeApi, entity, markName);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public List<MarkInfo> getActiveMarks(LivingEntity entity) {
-        if (!pluginPresent) return Collections.emptyList();
-        // TODO: Implement via native API
+        if (!isAvailable()) return Collections.emptyList();
+        // TODO: Map native MarkInfo to our MarkInfo
         return Collections.emptyList();
     }
 
     @Override
     public double getMarkDamageMultiplier(LivingEntity entity) {
-        if (!pluginPresent) return 1.0;
-        if (!(entity instanceof Player p)) return 1.0;
-        int raw = getScoreboardValue(p, "as_mark_dmg_mult");
-        return raw == 0 ? 1.0 : raw / 100.0;
+        if (!isAvailable()) return 1.0;
+        try {
+            return (double) mGetMarkDamageMultiplier.invoke(nativeApi, entity);
+        } catch (Exception e) {
+            return 1.0;
+        }
     }
 
     @Override
     public LivingEntity getSelectedTarget(Player player) {
-        // TODO: Implement via native API
-        return null;
+        if (!isAvailable()) return null;
+        try {
+            return (LivingEntity) mGetSelectedTarget.invoke(nativeApi, player);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @Override
     public LivingEntity getLastVictim(Player player) {
-        // TODO: Implement via native API
-        return null;
-    }
-
-    private int getScoreboardValue(Player player, String objectiveName) {
+        if (!isAvailable()) return null;
         try {
-            Scoreboard scoreboard = Bukkit.getScoreboardManager().getMainScoreboard();
-            Objective objective = scoreboard.getObjective(objectiveName);
-            if (objective == null) return 0;
-            Score score = objective.getScore(player);
-            return score.isScoreSet() ? score.getScore() : 0;
+            return (LivingEntity) mGetLastVictim.invoke(nativeApi, player);
         } catch (Exception e) {
-            return 0;
+            return null;
         }
     }
 }
