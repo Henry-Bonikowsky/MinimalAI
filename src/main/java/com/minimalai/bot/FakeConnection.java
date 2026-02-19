@@ -92,6 +92,14 @@ public class FakeConnection {
         }
 
         @Override
+        public void tick() {
+            // No-op: skip keepalive checks that would disconnect the fake player.
+            // Without this, ServerGamePacketListenerImpl.tick() sends keepalive
+            // packets (which our send() drops), then disconnects after timeout,
+            // which breaks aiStep()/travel() and entity tracking.
+        }
+
+        @Override
         public void send(Packet<?> packet) {
             // Silently drop
         }

@@ -18,6 +18,8 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 
+import net.minecraft.world.level.GameType;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -108,6 +110,10 @@ public class FakePlayerManager implements Listener {
             // overwriting our NoOpPacketListener. Swap ours back in so
             // tick() is no-op'd (prevents keepalive timeout disconnect).
             fakeConn.reattach(bot);
+
+            // Ensure bot is in survival mode and hittable
+            bot.setGameMode(GameType.SURVIVAL);
+            bot.setInvulnerable(false);
 
             // Re-position after placeNewPlayer because plugins like Multiverse
             // may teleport the bot to a spawn world during the join event.

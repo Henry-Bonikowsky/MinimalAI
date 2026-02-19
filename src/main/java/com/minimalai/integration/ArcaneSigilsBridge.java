@@ -42,6 +42,8 @@ public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
     private Method mGetSelectedTarget;
     private Method mGetLastVictim;
     private Method mGetEquippedSigils;
+    private Method mRegisterBotSigils;
+    private Method mUnregisterBotSigils;
 
     public ArcaneSigilsBridge(Logger logger) {
         this.logger = logger;
@@ -89,6 +91,8 @@ public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
             mGetSelectedTarget = apiClass.getMethod("getSelectedTarget", Player.class);
             mGetLastVictim = apiClass.getMethod("getLastVictim", Player.class);
             mGetEquippedSigils = apiClass.getMethod("getEquippedSigils", Player.class);
+            mRegisterBotSigils = apiClass.getMethod("registerBotSigils", Player.class, java.util.List.class);
+            mUnregisterBotSigils = apiClass.getMethod("unregisterBotSigils", Player.class);
         } catch (NoSuchMethodException e) {
             logger.warning("ArcaneSigils API method not found: " + e.getMessage());
             nativeApi = null;
@@ -273,6 +277,27 @@ public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
             return (LivingEntity) mGetSelectedTarget.invoke(nativeApi, player);
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    @Override
+    public void registerBotSigils(Player player, java.util.List<String> sigilIds) {
+        if (!isAvailable()) return;
+        try {
+            mRegisterBotSigils.invoke(nativeApi, player, sigilIds);
+            logger.info("Registered " + sigilIds.size() + " virtual sigils for bot " + player.getName());
+        } catch (Exception e) {
+            logger.warning("Failed to register bot sigils: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void unregisterBotSigils(Player player) {
+        if (!isAvailable()) return;
+        try {
+            mUnregisterBotSigils.invoke(nativeApi, player);
+        } catch (Exception e) {
+            logger.warning("Failed to unregister bot sigils: " + e.getMessage());
         }
     }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy MinimalAI to BisectHosting via SFTP"""
+"""Deploy MinimalAI to GravelHost via SFTP"""
 import os
 import sys
 import glob
@@ -22,9 +22,9 @@ def get_sftp():
 
 def cmd_deploy(args):
     """Upload latest JAR, optionally delete old ones"""
-    jars = [j for j in glob.glob("build/libs/MinimalAI-*.jar") if "reobf" in j]
+    jars = [j for j in glob.glob("build/libs/MinimalAI-*.jar") if "reobf" not in j]
     if not jars:
-        print("No reobf JAR found in build/libs/. Build first.")
+        print("No JAR found in build/libs/. Build first.")
         sys.exit(1)
 
     jar = max(jars, key=os.path.getmtime)
@@ -106,7 +106,7 @@ def cmd_rm(args):
         transport.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="BisectHosting SFTP tool")
+    parser = argparse.ArgumentParser(description="GravelHost SFTP tool")
     sub = parser.add_subparsers(dest="cmd")
 
     p_deploy = sub.add_parser("deploy", help="Upload latest JAR")

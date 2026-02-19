@@ -62,9 +62,14 @@ public class ActionExecutor {
         boolean isReady(Player player, int slotIndex);
     }
 
-    // Approximate walk/sprint speeds in blocks/tick (matching sim values)
-    private static final float WALK_SPEED = 0.1f;
-    private static final float SPRINT_SPEED = 0.26f;
+    // Vanilla movement speeds in blocks/tick
+    private static final float WALK_SPEED = 0.216f;   // 4.317 m/s
+    private static final float SPRINT_SPEED = 0.281f;  // 5.612 m/s
+
+    // Physics constants (vanilla)
+    private static final double GRAVITY = 0.08;
+    private static final double VERTICAL_DRAG = 0.98;
+    private static final double GROUND_FRICTION = 0.546; // 0.91 * 0.6 (default block)
 
     // Vanilla melee reach and max angle for hit registration
     private static final double MELEE_REACH = 3.0;
@@ -144,26 +149,31 @@ public class ActionExecutor {
         float forward = actions[ACT_FORWARD] - actions[ACT_BACKWARD]; // -1, 0, or 1
         float strafe = actions[ACT_STRAFE_LEFT] - actions[ACT_STRAFE_RIGHT]; // -1, 0, or 1
 
-        if (forward == 0 && strafe == 0) {
-            // No movement input -- keep vertical momentum, zero horizontal
-            Vec3 current = bot.getDeltaMovement();
-            Vec3 verticalOnly = new Vec3(0, current.y, 0);
-            bot.setDeltaMovement(verticalOnly);
-            bot.move(MoverType.SELF, verticalOnly);
-            return;
+        // Compute vertical component: gravity + drag
+        Vec3 current = bot.getDeltaMovement();
+        double y = current.y;
+        if (!bot.onGround()) {
+            y -= GRAVITY;
+            y *= VERTICAL_DRAG;
+        } else {
+            // On ground, reset downward velocity
+            y = Math.max(y, 0);
         }
 
-        float yawRad = (float) Math.toRadians(bot.getYRot());
-        float speed = bot.isSprinting() ? SPRINT_SPEED : WALK_SPEED;
+        // Compute horizontal component
+        double dx, dz;
+        if (forward == 0 && strafe == 0) {
+            dx = 0;
+            dz = 0;
+        } else {
+            float yawRad = (float) Math.toRadians(bot.getYRot());
+            float speed = bot.isSprinting() ? SPRINT_SPEED : WALK_SPEED;
+            dx = (-Math.sin(yawRad) * forward + Math.cos(yawRad) * strafe) * speed;
+            dz = (Math.cos(yawRad) * forward + Math.sin(yawRad) * strafe) * speed;
+        }
 
-        double dx = (-Math.sin(yawRad) * forward + Math.cos(yawRad) * strafe) * speed;
-        double dz = (Math.cos(yawRad) * forward + Math.sin(yawRad) * strafe) * speed;
-
-        Vec3 current = bot.getDeltaMovement();
-        Vec3 movement = new Vec3(dx, current.y, dz);
+        Vec3 movement = new Vec3(dx, y, dz);
         bot.setDeltaMovement(movement);
-        // ServerPlayer movement is packet-driven; setDeltaMovement alone won't
-        // change position. Explicitly apply the displacement with collision.
         bot.move(MoverType.SELF, movement);
     }
 
@@ -357,16 +367,10 @@ public class ActionExecutor {
     // ------------------------------------------------------------------
 
     private void applySigils(ServerPlayer bot, int[] actions) {
-        if (sigilsApi == null) return;
-
-        Player bukkitPlayer = getBukkitPlayer(bot);
-        if (bukkitPlayer == null) return;
-
-        for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
-            if (actions[ACT_SIGIL_0 + i] == 1) {
-                sigilsApi.activateAbility(bukkitPlayer, i);
-            }
-        }
+        // Sigils are now handled automatically by ArcaneSigils via BotSigilRegistry.
+        // Signal-based sigils (attack/defense/passive) fire through Bukkit events.
+        // Ability sigils auto-fire on ATTACK signal when off cooldown.
+        // No action-space activation needed.
     }
 
     // ------------------------------------------------------------------
@@ -494,17 +498,9 @@ public class ActionExecutor {
         // Swap weapon: always masked
         mask[ACT_SWAP_WEAPON] = 0f;
 
-        // Sigil slots
-        Player bukkitPlayer = getBukkitPlayer(bot);
+        // Sigil slots: always masked — sigils are handled automatically by ArcaneSigils
         for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
-            if (sigilsApi == null || bukkitPlayer == null) {
-                mask[ACT_SIGIL_0 + i] = 0f;
-            } else if (sigilCooldowns != null) {
-                mask[ACT_SIGIL_0 + i] = sigilCooldowns.isReady(bukkitPlayer, i) ? 1f : 0f;
-            } else {
-                // No cooldown query available; optimistically unmask
-                mask[ACT_SIGIL_0 + i] = 1f;
-            }
+            mask[ACT_SIGIL_0 + i] = 0f;
         }
 
         // Target selection: unmask slots that have a live entity

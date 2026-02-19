@@ -11,6 +11,7 @@ import com.minimalai.training.ExperienceBuffer;
 import com.minimalai.training.RewardComputer;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
@@ -83,6 +84,16 @@ public class BotCommand {
             kitManager.applyKit(ctx.serverPlayer(), kitName);
         }
 
+        // Register virtual sigils so ArcaneSigils auto-procs them
+        if (sigilsApi != null && sigilsApi.isAvailable()) {
+            Player bukkitPlayer = ctx.serverPlayer().getBukkitEntity();
+            List<ArcaneSigilsAPI.SigilInfo> equipped = sigilsApi.getEquippedSigils(bukkitPlayer);
+            if (!equipped.isEmpty()) {
+                List<String> sigilIds = equipped.stream().map(ArcaneSigilsAPI.SigilInfo::id).toList();
+                sigilsApi.registerBotSigils(bukkitPlayer, sigilIds);
+            }
+        }
+
         try {
             String model = modelName != null ? modelName : modelManager.listModels().get(0);
             BotBrain brain = new BotBrain(ctx.name(), ctx.serverPlayer(), modelManager, model,
@@ -123,6 +134,11 @@ public class BotCommand {
     public void removeBrain(String name) {
         BotBrain brain = brains.remove(name);
         if (brain != null) {
+            // Unregister virtual sigils
+            if (sigilsApi != null && sigilsApi.isAvailable()) {
+                Player bukkitPlayer = brain.getServerPlayer().getBukkitEntity();
+                sigilsApi.unregisterBotSigils(bukkitPlayer);
+            }
             if (rewardComputer != null) rewardComputer.unregisterBot(name);
             brain.close();
         }

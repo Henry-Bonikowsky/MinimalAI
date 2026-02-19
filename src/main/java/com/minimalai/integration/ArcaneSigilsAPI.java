@@ -49,6 +49,10 @@ public interface ArcaneSigilsAPI {
     LivingEntity getSelectedTarget(Player player);
     LivingEntity getLastVictim(Player player);
 
+    // --- Bot Sigil Registration ---
+    void registerBotSigils(Player player, List<String> sigilIds);
+    void unregisterBotSigils(Player player);
+
     // --- Availability ---
     boolean isAvailable();
 }
