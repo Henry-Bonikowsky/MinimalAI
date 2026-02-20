@@ -80,9 +80,24 @@ public class BotCommand {
         BotContext ctx = botManager.spawn(world, location, name);
         if (ctx == null) return null;
 
-        if (kitName != null) {
-            kitManager.applyKit(ctx.serverPlayer(), kitName);
-        }
+        // Delay kit + position reassert by 1 tick — placeNewPlayer triggers
+        // join-event processing where plugins may try to override inventory.
+        // Position is set via NMS setPos (no events) to avoid plugin interference.
+        final Location loc = location;
+        org.bukkit.Bukkit.getScheduler().runTaskLater(
+                org.bukkit.Bukkit.getPluginManager().getPlugin("MinimalAI"),
+                () -> {
+                    // Reassert position via NMS (no Bukkit event)
+                    ctx.serverPlayer().setPos(loc.getX(), loc.getY(), loc.getZ());
+                    ctx.serverPlayer().setYRot(loc.getYaw());
+                    ctx.serverPlayer().setXRot(loc.getPitch());
+                    ctx.serverPlayer().setYHeadRot(loc.getYaw());
+                    if (kitName != null) {
+                        kitManager.applyKit(ctx.serverPlayer(), kitName);
+                    }
+                },
+                1L
+        );
 
         // Register virtual sigils so ArcaneSigils auto-procs them
         if (sigilsApi != null && sigilsApi.isAvailable()) {

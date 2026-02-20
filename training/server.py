@@ -367,9 +367,17 @@ class TrainingServer:
                 + (1.0 - actions) * np.log(1.0 - probs_clamped)
             )
 
-            # Build action mask: all ones (Java should provide proper mask,
-            # but for now assume all actions valid from received data)
+            # Reconstruct action mask from actionProbs: Java masks invalid actions
+            # to prob 0 before sampling, so near-zero probs indicate masked actions.
+            # Swap weapon (13) and sigils (14-25) are always masked server-side.
             action_mask = np.ones(NUM_ACTIONS, dtype=np.float32)
+            action_mask[13] = 0.0  # ACT_SWAP_WEAPON always masked
+            for i in range(14, 26):  # sigil slots always masked
+                action_mask[i] = 0.0
+            # Additionally mask any action where prob was exactly 0 (item unavailable, etc.)
+            for i in range(NUM_ACTIONS):
+                if action_probs[i] < 1e-6:
+                    action_mask[i] = 0.0
 
             experiences.append({
                 "obs": {

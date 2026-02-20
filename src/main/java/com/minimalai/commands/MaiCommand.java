@@ -655,6 +655,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
                 return;
             }
             brain.setRecordingMode(recorder);
+            rewardComputer.registerRecorder(ctx.name(), recorder);
             activeRecordingBot = ctx.name();
 
             sender.sendMessage(PREFIX + ChatColor.GREEN + "Recording started for " + seconds + "s. Bot uses random actions.");
@@ -691,7 +692,8 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
             int ticks = recorder != null ? recorder.getTickCount() : 0;
             Path file = recorder != null ? recorder.getFilePath() : null;
 
-            // Close brain (also closes recorder)
+            // Unregister recorder and close brain
+            rewardComputer.unregisterRecorder(botName);
             botCmd.removeBrain(botName);
             botCmd.getBotManager().despawn(botName);
 

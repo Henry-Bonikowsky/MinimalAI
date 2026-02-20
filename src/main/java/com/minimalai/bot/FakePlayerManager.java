@@ -17,6 +17,8 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.metadata.FixedMetadataValue;
+import org.bukkit.plugin.Plugin;
 
 import net.minecraft.world.level.GameType;
 
@@ -37,11 +39,13 @@ import java.util.logging.Logger;
 public class FakePlayerManager implements Listener {
 
     private final Logger logger;
+    private final Plugin plugin;
     private final Map<String, BotContext> activeBots = new ConcurrentHashMap<>();
     private int nextBotId = 1;
 
-    public FakePlayerManager(Logger logger) {
+    public FakePlayerManager(Logger logger, Plugin plugin) {
         this.logger = logger;
+        this.plugin = plugin;
     }
 
     /**
@@ -115,10 +119,15 @@ public class FakePlayerManager implements Listener {
             bot.setGameMode(GameType.SURVIVAL);
             bot.setInvulnerable(false);
 
-            // Re-position after placeNewPlayer because plugins like Multiverse
-            // may teleport the bot to a spawn world during the join event.
-            bot.teleportTo(level, location.getX(), location.getY(), location.getZ(),
-                    java.util.Set.of(), location.getYaw(), location.getPitch(), true);
+            // Mark as NPC so other plugins (TAB, Citizens-compat, etc.) skip this player
+            bot.getBukkitEntity().setMetadata("NPC", new FixedMetadataValue(plugin, true));
+
+            // Re-position after placeNewPlayer via NMS setPos (no Bukkit events).
+            // placeNewPlayer sends the bot to world spawn; we force it back here.
+            bot.setPos(location.getX(), location.getY(), location.getZ());
+            bot.setYRot(location.getYaw());
+            bot.setXRot(location.getPitch());
+            bot.setYHeadRot(location.getYaw());
 
             BotContext ctx = new BotContext(name, bot, fakeConn);
             activeBots.put(name, ctx);
@@ -211,19 +220,14 @@ public class FakePlayerManager implements Listener {
     }
 
     /**
-     * Prevent external plugins (Multiverse, etc.) from teleporting our bots away.
-     * Allows PLUGIN and COMMAND causes so our own code can reposition bots.
+     * Block ALL teleport events for bots. We reposition bots using NMS
+     * setPos() which doesn't fire Bukkit events, so any teleport event
+     * reaching here is from an external plugin (Essentials, WorldGuard, etc.)
+     * and must be cancelled.
      */
     @EventHandler(priority = EventPriority.LOWEST)
     public void onBotTeleport(PlayerTeleportEvent event) {
         if (!isBot(event.getPlayer().getName())) return;
-
-        // Allow our own teleports (PLUGIN cause from teleportTo, COMMAND from commands)
-        PlayerTeleportEvent.TeleportCause cause = event.getCause();
-        if (cause == PlayerTeleportEvent.TeleportCause.PLUGIN
-                || cause == PlayerTeleportEvent.TeleportCause.COMMAND) {
-            return; // let it through
-        }
         event.setCancelled(true);
     }
 

@@ -68,12 +68,24 @@ public class FakeConnection {
     }
 
     /**
-     * Reassign the NoOpPacketListener onto the player AFTER placeNewPlayer().
-     * placeNewPlayer creates its own ServerGamePacketListenerImpl and overwrites ours,
-     * which causes keepalive timeouts. This swaps ours back in.
+     * Reassign the NoOpPacketListener onto the player AND the Connection
+     * AFTER placeNewPlayer(). placeNewPlayer creates its own
+     * ServerGamePacketListenerImpl and registers it on both player.connection
+     * and connection.packetListener. We must replace BOTH references so the
+     * real SGPLI's tick() (keepalive checks, movement validation, anti-cheat
+     * position resets) never runs.
      */
     public void reattach(ServerPlayer player) {
         player.connection = packetListener;
+        // Replace the listener on the Connection object itself —
+        // same call placeNewPlayer uses internally.
+        connection.setupInboundProtocol(
+                net.minecraft.network.protocol.game.GameProtocols.SERVERBOUND_TEMPLATE
+                        .bind(net.minecraft.network.RegistryFriendlyByteBuf.decorator(
+                                net.minecraft.server.MinecraftServer.getServer().registryAccess()),
+                                packetListener),
+                packetListener
+        );
     }
 
     public Connection connection() {
@@ -93,10 +105,11 @@ public class FakeConnection {
 
         @Override
         public void tick() {
-            // No-op: skip keepalive checks that would disconnect the fake player.
-            // Without this, ServerGamePacketListenerImpl.tick() sends keepalive
-            // packets (which our send() drops), then disconnects after timeout,
-            // which breaks aiStep()/travel() and entity tracking.
+            // Skip keepalive/network checks (would disconnect the fake player),
+            // but still tick the player for movement, combat cooldowns, potion
+            // effects, etc. Vanilla's aiStep() → travel() processes xxa/zza input,
+            // gravity, knockback, and friction.
+            this.player.doTick();
         }
 
         @Override

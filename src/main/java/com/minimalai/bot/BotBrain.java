@@ -104,6 +104,7 @@ public class BotBrain {
      */
     public void tick() {
         if (paused) return;
+        if (!bot.isAlive()) return;
 
         // Recording mode: random actions + physics logging, no model needed
         if (recordingMode && physicsRecorder != null) {
@@ -122,7 +123,8 @@ public class BotBrain {
 
             // No enemies nearby — stand still, don't run inference
             if (target == null) {
-                bot.setDeltaMovement(0, bot.getDeltaMovement().y, 0);
+                bot.xxa = 0;
+                bot.zza = 0;
                 bot.setSprinting(false);
                 return;
             }
@@ -155,8 +157,9 @@ public class BotBrain {
             // 4. Sample actions from probabilities with mask
             int[] actions = sampleActions(result.actionProbs, actionMask);
 
-            // 5. Execute actions
-            LivingEntity newTarget = actionExecutor.execute(bot, actions, target, nearby);
+            // 5. Execute actions (with reward callbacks if training)
+            LivingEntity newTarget = actionExecutor.execute(
+                    bot, actions, target, nearby, rewardComputer, name);
             if (newTarget != null) {
                 target = newTarget;
             }
@@ -314,8 +317,11 @@ public class BotBrain {
                 target = findNearestEnemy();
             }
 
-            // Capture pre-action state
+            // Capture pre-action state (full snapshot with health, armor, etc.)
             PhysicsRecorder.StateSnapshot pre = PhysicsRecorder.StateSnapshot.capture(bot);
+
+            // Get block friction below bot
+            float blockFriction = PhysicsRecorder.getBlockFriction(bot);
 
             // Build action mask
             List<LivingEntity> nearby = getNearbyEntities();
@@ -333,8 +339,8 @@ public class BotBrain {
             // Capture post-action state
             PhysicsRecorder.StateSnapshot post = PhysicsRecorder.StateSnapshot.capture(bot);
 
-            // Record the tick
-            physicsRecorder.record(name, pre, post, actions, target, bot);
+            // Record the tick with full state
+            physicsRecorder.record(name, pre, post, actions, target, bot, blockFriction);
 
         } catch (Exception e) {
             LOG.warning("Recording tick error for '" + name + "': " + e.getMessage());

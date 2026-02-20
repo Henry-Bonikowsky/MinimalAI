@@ -178,8 +178,16 @@ def measure_knockback(df: pd.DataFrame) -> dict:
         print(f"  WARNING: Only {len(hits)} damage-taken ticks found")
         return {}
 
-    kb_horiz = np.sqrt(hits["kb_x"] ** 2 + hits["kb_z"] ** 2)
-    kb_vert = hits["kb_y"]
+    # Support both old (kb_x/y/z) and new (hit_vel_x/y/z) column names
+    if "hit_vel_x" in hits.columns:
+        kb_horiz = np.sqrt(hits["hit_vel_x"] ** 2 + hits["hit_vel_z"] ** 2)
+        kb_vert = hits["hit_vel_y"]
+    elif "kb_x" in hits.columns:
+        kb_horiz = np.sqrt(hits["kb_x"] ** 2 + hits["kb_z"] ** 2)
+        kb_vert = hits["kb_y"]
+    else:
+        print("  WARNING: No knockback columns found (expected hit_vel_x or kb_x)")
+        return {}
 
     result = {
         "horiz_mean": kb_horiz.mean(),

@@ -12,8 +12,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
-import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.phys.Vec3;
+import com.minimalai.training.RewardComputer;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
@@ -62,15 +62,6 @@ public class ActionExecutor {
         boolean isReady(Player player, int slotIndex);
     }
 
-    // Vanilla movement speeds in blocks/tick
-    private static final float WALK_SPEED = 0.216f;   // 4.317 m/s
-    private static final float SPRINT_SPEED = 0.281f;  // 5.612 m/s
-
-    // Physics constants (vanilla)
-    private static final double GRAVITY = 0.08;
-    private static final double VERTICAL_DRAG = 0.98;
-    private static final double GROUND_FRICTION = 0.546; // 0.91 * 0.6 (default block)
-
     // Vanilla melee reach and max angle for hit registration
     private static final double MELEE_REACH = 3.0;
     private static final double MELEE_ANGLE_COS = Math.cos(Math.toRadians(60)); // ~60° cone
@@ -82,8 +73,13 @@ public class ActionExecutor {
     private static class EatingState {
         int ticksRemaining = 0;
         InteractionHand hand = null;
+        int originalSlot = 0; // hotbar slot to restore after eating
     }
     private final Map<Integer, EatingState> eatingStates = new ConcurrentHashMap<>();
+
+    // Per-execution context (set at start of execute, cleared at end)
+    private @Nullable RewardComputer rewardCtx;
+    private @Nullable String rewardBotName;
 
     /**
      * @param sigilsApi      nullable; set if ArcaneSigils is loaded
@@ -120,12 +116,27 @@ public class ActionExecutor {
                                           int[] actions,
                                           @Nullable LivingEntity target,
                                           List<LivingEntity> nearbyEntities) {
+        return execute(bot, actions, target, nearbyEntities, null, null);
+    }
+
+    /**
+     * Apply actions with optional reward feedback for action-quality signals.
+     */
+    public @Nullable LivingEntity execute(ServerPlayer bot,
+                                          int[] actions,
+                                          @Nullable LivingEntity target,
+                                          List<LivingEntity> nearbyEntities,
+                                          @Nullable RewardComputer rewards,
+                                          @Nullable String botName) {
+        // Set per-execution reward context
+        this.rewardCtx = rewards;
+        this.rewardBotName = botName;
 
         applyMovement(bot, actions);
         applyJump(bot, actions);
         applySneak(bot, actions);
         applySprint(bot, actions);
-        applySprintReset(bot, actions);
+        applySprintReset(bot, actions, target);
         // Look BEFORE attack so the bot faces the target first
         applyLookIntent(bot, actions, target);
         applyAttack(bot, actions, target);
@@ -138,6 +149,10 @@ public class ActionExecutor {
 
         tickEating(bot);
 
+        // Clear per-execution context
+        this.rewardCtx = null;
+        this.rewardBotName = null;
+
         return resolveTarget(actions, target, nearbyEntities);
     }
 
@@ -146,35 +161,17 @@ public class ActionExecutor {
     // ------------------------------------------------------------------
 
     private void applyMovement(ServerPlayer bot, int[] actions) {
-        float forward = actions[ACT_FORWARD] - actions[ACT_BACKWARD]; // -1, 0, or 1
-        float strafe = actions[ACT_STRAFE_LEFT] - actions[ACT_STRAFE_RIGHT]; // -1, 0, or 1
+        // Set vanilla input fields — LivingEntity.travel() handles all physics,
+        // including gravity, friction, knockback, and collisions.
+        bot.zza = actions[ACT_FORWARD] - actions[ACT_BACKWARD];
+        bot.xxa = actions[ACT_STRAFE_LEFT] - actions[ACT_STRAFE_RIGHT];
+    }
 
-        // Compute vertical component: gravity + drag
-        Vec3 current = bot.getDeltaMovement();
-        double y = current.y;
-        if (!bot.onGround()) {
-            y -= GRAVITY;
-            y *= VERTICAL_DRAG;
-        } else {
-            // On ground, reset downward velocity
-            y = Math.max(y, 0);
-        }
-
-        // Compute horizontal component
-        double dx, dz;
-        if (forward == 0 && strafe == 0) {
-            dx = 0;
-            dz = 0;
-        } else {
-            float yawRad = (float) Math.toRadians(bot.getYRot());
-            float speed = bot.isSprinting() ? SPRINT_SPEED : WALK_SPEED;
-            dx = (-Math.sin(yawRad) * forward + Math.cos(yawRad) * strafe) * speed;
-            dz = (Math.cos(yawRad) * forward + Math.sin(yawRad) * strafe) * speed;
-        }
-
-        Vec3 movement = new Vec3(dx, y, dz);
-        bot.setDeltaMovement(movement);
-        bot.move(MoverType.SELF, movement);
+    /**
+     * Clean up per-bot tracking state when a bot is removed.
+     */
+    public void clearBotState(int entityId) {
+        eatingStates.remove(entityId);
     }
 
     // ------------------------------------------------------------------
@@ -182,9 +179,8 @@ public class ActionExecutor {
     // ------------------------------------------------------------------
 
     private void applyJump(ServerPlayer bot, int[] actions) {
-        if (actions[ACT_JUMP] == 1 && bot.onGround()) {
-            bot.jumpFromGround();
-        }
+        // Set vanilla jumping flag — LivingEntity.aiStep() handles ground check
+        bot.setJumping(actions[ACT_JUMP] == 1);
     }
 
     // ------------------------------------------------------------------
@@ -207,10 +203,16 @@ public class ActionExecutor {
     //  Sprint Reset (action 12) -- same-tick toggle for KB boost
     // ------------------------------------------------------------------
 
-    private void applySprintReset(ServerPlayer bot, int[] actions) {
+    private void applySprintReset(ServerPlayer bot, int[] actions,
+                                   @Nullable LivingEntity target) {
         if (actions[ACT_SPRINT_RESET] == 1) {
             bot.setSprinting(false);
             bot.setSprinting(true);
+
+            if (rewardCtx != null && rewardBotName != null && target != null) {
+                float dist = (float) bot.distanceTo(target);
+                rewardCtx.onBotSprintReset(rewardBotName, dist);
+            }
         }
     }
 
@@ -222,9 +224,24 @@ public class ActionExecutor {
                              @Nullable LivingEntity target) {
         if (actions[ACT_ATTACK] != 1 || target == null || !target.isAlive()) return;
 
+        // Don't attack while eating (golden apple is in main hand)
+        EatingState es = eatingStates.get(bot.getId());
+        if (es != null && es.ticksRemaining > 0) return;
+
+        // Must be holding a sword to attack effectively
+        if (!isSword(bot.getMainHandItem())) return;
+
         // Range check: vanilla player reach is ~3 blocks
         double dist = bot.distanceTo(target);
-        if (dist > MELEE_REACH) return;
+        boolean inRange = dist <= MELEE_REACH;
+
+        if (!inRange) {
+            // Whiff: attack action fired but out of range
+            if (rewardCtx != null && rewardBotName != null) {
+                rewardCtx.onBotAttack(rewardBotName, false, false);
+            }
+            return;
+        }
 
         // Angle check: bot must be roughly facing the target
         double dx = target.getX() - bot.getX();
@@ -235,10 +252,22 @@ public class ActionExecutor {
             double lookX = -Math.sin(yawRad);
             double lookZ = Math.cos(yawRad);
             double dot = (lookX * dx + lookZ * dz) / horizDist;
-            if (dot < MELEE_ANGLE_COS) return; // target is outside the ~60° cone
+            if (dot < MELEE_ANGLE_COS) {
+                // Whiff: facing wrong direction
+                if (rewardCtx != null && rewardBotName != null) {
+                    rewardCtx.onBotAttack(rewardBotName, false, false);
+                }
+                return;
+            }
         }
 
+        // Check i-frame waste before attacking
+        boolean iFrameWaste = target.invulnerableTime > 0;
         bot.attack(target); // vanilla damage calc, knockback, crits
+
+        if (rewardCtx != null && rewardBotName != null) {
+            rewardCtx.onBotAttack(rewardBotName, true, iFrameWaste);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -280,14 +309,23 @@ public class ActionExecutor {
                 stack.is(Items.GOLDEN_APPLE) || stack.is(Items.ENCHANTED_GOLDEN_APPLE));
         if (slot == -1) return;
 
+        // Remember current slot to restore after eating
+        es.originalSlot = bot.getBukkitEntity().getInventory().getHeldItemSlot();
+
         // Move the apple to main hand and start using
         swapToSlot(bot, slot);
         bot.startUsingItem(InteractionHand.MAIN_HAND);
         es.ticksRemaining = 32; // golden apple use time
         es.hand = InteractionHand.MAIN_HAND;
+
+        // Reward callback for gap timing
+        if (rewardCtx != null && rewardBotName != null) {
+            float healthRatio = bot.getHealth() / bot.getMaxHealth();
+            rewardCtx.onBotUseGap(rewardBotName, healthRatio);
+        }
     }
 
-    /** Tick down eating state; stop using when done. */
+    /** Tick down eating state; restore original slot when done. */
     private void tickEating(ServerPlayer bot) {
         EatingState es = eatingStates.get(bot.getId());
         if (es == null || es.ticksRemaining <= 0) return;
@@ -296,6 +334,8 @@ public class ActionExecutor {
             // Let vanilla finish the use (completeUsingItem is called automatically
             // by the server when useItemRemainingTicks reaches 0).
             es.hand = null;
+            // Swap back to original slot (usually the sword)
+            bot.getBukkitEntity().getInventory().setHeldItemSlot(es.originalSlot);
         }
     }
 
@@ -327,6 +367,12 @@ public class ActionExecutor {
         potStack.shrink(1);
         if (potStack.isEmpty()) {
             bot.getInventory().setItem(slot, ItemStack.EMPTY);
+        }
+
+        // Reward callback for pot timing
+        if (rewardCtx != null && rewardBotName != null) {
+            float healthRatio = bot.getHealth() / bot.getMaxHealth();
+            rewardCtx.onBotUsePot(rewardBotName, healthRatio);
         }
     }
 

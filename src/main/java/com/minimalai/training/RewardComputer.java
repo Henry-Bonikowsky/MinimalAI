@@ -38,6 +38,9 @@ public class RewardComputer implements Listener {
     // Optional observation builder to forward damage events for combat features
     private @Nullable ObservationBuilder obsBuilder;
 
+    // Physics recorders to forward damage/KB events for recording sessions
+    private final Map<String, PhysicsRecorder> recorders = new ConcurrentHashMap<>();
+
     // --- Per-bot tracking ---
     private final Map<String, Float> pendingRewards = new ConcurrentHashMap<>();
     private final Map<String, Float> previousHealth = new ConcurrentHashMap<>();
@@ -121,6 +124,14 @@ public class RewardComputer implements Listener {
         this.obsBuilder = obsBuilder;
     }
 
+    public void registerRecorder(String name, PhysicsRecorder recorder) {
+        recorders.put(name, recorder);
+    }
+
+    public void unregisterRecorder(String name) {
+        recorders.remove(name);
+    }
+
     // ----------------------------------------------------------------
     //  Bukkit event handlers
     // ----------------------------------------------------------------
@@ -132,9 +143,12 @@ public class RewardComputer implements Listener {
             float dealt = (float) e.getFinalDamage();
             float reward = (dealt / 20.0f) * damageDealtScale;
             addReward(attacker.getName(), reward);
-            // Forward to observation builder for combat context features
             if (obsBuilder != null) {
                 obsBuilder.onDamageDealt(attacker.getName(), dealt);
+            }
+            PhysicsRecorder rec = recorders.get(attacker.getName());
+            if (rec != null) {
+                rec.onDamageDealt(dealt);
             }
         }
 
@@ -143,9 +157,17 @@ public class RewardComputer implements Listener {
             float taken = (float) e.getFinalDamage();
             float penalty = -(taken / 20.0f) * damageTakenScale;
             addReward(victim.getName(), penalty);
-            // Forward to observation builder for combat context features
             if (obsBuilder != null) {
                 obsBuilder.onDamageTaken(victim.getName(), taken);
+            }
+            PhysicsRecorder rec = recorders.get(victim.getName());
+            if (rec != null) {
+                // Extract knockback from the velocity change
+                Player victimPlayer = victim;
+                rec.onDamageTaken(taken,
+                        victimPlayer.getVelocity().getX(),
+                        victimPlayer.getVelocity().getY(),
+                        victimPlayer.getVelocity().getZ());
             }
         }
     }

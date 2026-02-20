@@ -45,7 +45,7 @@ public class MinimalAIPlugin extends JavaPlugin {
         sigilsBridge = new ArcaneSigilsBridge(getLogger());
 
         // Initialize bot system
-        botManager = new FakePlayerManager(getLogger());
+        botManager = new FakePlayerManager(getLogger(), this);
         getServer().getPluginManager().registerEvents(botManager, this);
 
         // Initialize model manager

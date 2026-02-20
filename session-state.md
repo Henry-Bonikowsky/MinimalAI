@@ -1,68 +1,30 @@
-## Session State - December 21, 2025
+# 2026-02-20 | MinimalAI Pipeline Bug Fixes & Action Space Alignment
 
-### What was done
-- Added Phase 7: Reinforcement Learning Training
-  - `SimpleNetworkRL.java` - Network with frame stacking (4 frames × 64 = 256 input) and value head
-  - `ExperienceBuffer.java` - Stores episode experiences for REINFORCE
-  - `RewardDetector.java` - Hooks into block break events for reward signals
-  - `EpisodeManager.java` - Handles episode lifecycle, timeout, death, auto-reset
-  - `RLTrainer.java` - REINFORCE algorithm with interleaved BC training
-  - `RLController.java` - Main RL training loop controller
-  - Added 'L' keybind for RL training mode
+DONE:
+- Fixed golden apple attack bug: applyAttack now guards against eating state and non-sword items, tickEating restores original hotbar slot after eating completes
+- Aligned camera action space: Python sim now uses intent-based camera (FACE_TARGET/FACE_AWAY/LOOK_DOWN_SELF/FACE_MOVEMENT) matching Java, instead of incremental turns
+- Wired all dead reward callbacks: ActionExecutor now calls RewardComputer.onBotAttack (whiff/iframe), onBotSprintReset, onBotUseGap, onBotUsePot during execution when training is active
+- Fixed calibrate_physics.py to support both old (kb_x/y/z) and new (hit_vel_x/y/z) column names
+- Fixed server.py action mask: reconstructs mask from actionProbs instead of hardcoding all-ones (swap weapon + sigils always masked, near-zero probs masked)
+- Build successful, Python sim smoke test passed, TorchScript export verified
 
-### Project structure
-```
-MinimalAI/
-├── src/main/java/com/minimalai/
-│   ├── MinimalAI.java (entry point)
-│   ├── ModKeybinds.java (Y=Dashboard, R=Record, P=Play, T=Train, I=AI, L=RL, End=Stop)
-│   ├── ai/
-│   │   ├── SimpleNetwork.java (64→256→128→20+2, for BC)
-│   │   ├── SimpleNetworkRL.java (256→256→128→20+2+1, frame stacking + value head)
-│   │   ├── Trainer.java (behavior cloning)
-│   │   ├── RLTrainer.java (REINFORCE + interleaved BC)
-│   │   ├── RLController.java (RL training loop)
-│   │   ├── AIController.java (runs trained BC model)
-│   │   ├── ExperienceBuffer.java (episode experience storage)
-│   │   ├── EpisodeManager.java (episode lifecycle)
-│   │   └── RewardDetector.java (block break reward detection)
-│   ├── recording/
-│   │   ├── GameStateCollector.java
-│   │   ├── ActionRecorder.java
-│   │   ├── Recording.java
-│   │   └── RecordingStorage.java, RecordingManager.java
-│   ├── playback/
-│   │   ├── ActionExecutor.java
-│   │   └── PlaybackController.java
-│   └── ui/
-│       ├── OverlayRenderer.java
-│       └── DashboardScreen.java
-```
+FILES: ActionExecutor.java, BotBrain.java, training/combat_sim/env.py, training/diagnose.py, training/calibrate_physics.py, training/server.py
 
-### RL Training Workflow
-1. Record gameplay (R key) to teach action vocabulary
-2. BC train (T key) to initialize network with basic behaviors
-3. Position player at training spot, press L to start RL training
-4. RL loop:
-   - BC pass (prevents forgetting)
-   - Episode runs until block mined (reward=1), timeout (reward=0), or death (reward=0)
-   - REINFORCE update
-   - Auto-reset to start position
-   - Repeat
-5. End key stops training and saves model
+NEXT:
+1. Deploy to server: `./gradlew clean build && python deploy.py deploy` then restart server
+2. Connect MC client, test `/mai bot spawn TestBot default warrior` — verify sword in hand, attacks work
+3. Test `/mai record start 60 warrior` — verify recording captures all actions
+4. Run `python training/calibrate_physics.py <csv>` on new recording
+5. Train in sim: `cd training && python train.py` — first 1M steps, verify rewards trend up
+6. Export model: `python training/export.py checkpoints/best.pt --output models/warrior.pt`
+7. Load in-game: `/mai model load warrior` then `/mai model duel warrior warrior`
+8. If all pass: start batch training with self-play, then deploy trained model
 
-### Key Design Decisions
-- Frame stacking (4 frames) for temporal context instead of LSTM
-- Sparse reward only (block mined = +1), no shaping
-- Interleaved BC to prevent catastrophic forgetting
-- Episode ends on first block break (simple goal)
-- Auto-reset via teleport command
-
-### Current status
-RL training infrastructure complete. Ready for testing.
-
-### Next steps
-- Test RL training loop in-game
-- Verify reward detection works
-- Tune hyperparameters if needed
-- Consider adding UI indicators for RL mode status
+CONTEXT:
+- Branch: feature/bot-brain-fixes-and-physics-recording
+- Build: `./gradlew clean build` → `python deploy.py deploy`
+- MC server connection failing (2026-02-20) — server may be offline or MS auth token expired
+- ActionExecutor.execute() now has 6-param overload accepting RewardComputer + botName
+- Camera actions 26-29 are now semantically aligned between Java and Python
+- All reward callbacks are wired: whiff (-0.05), iframe waste (-0.03), pot timing (±0.3/-0.2), gap timing (+0.1), sprint reset (+0.15)
+- Python sim verified: env.step with FACE_TARGET works, network forward pass OK, TorchScript export OK
