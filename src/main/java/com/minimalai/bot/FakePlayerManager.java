@@ -16,10 +16,11 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerKickEvent;
-import org.bukkit.event.player.PlayerTeleportEvent;
+
 import org.bukkit.metadata.FixedMetadataValue;
 import org.bukkit.plugin.Plugin;
 
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.level.GameType;
 
 import java.util.*;
@@ -57,6 +58,14 @@ public class FakePlayerManager implements Listener {
      * @return the BotContext wrapping the ServerPlayer, or null on failure
      */
     public BotContext spawn(World world, Location location, String name) {
+        return spawn(world, location, name, null);
+    }
+
+    /**
+     * Spawn a fake player with an optional pre-built GameProfile.
+     * Use this to provide a fixed UUID and/or skin textures.
+     */
+    public BotContext spawn(World world, Location location, String name, GameProfile providedProfile) {
         if (name == null || name.isBlank()) {
             name = "Bot_" + nextBotId++;
         }
@@ -76,19 +85,27 @@ public class FakePlayerManager implements Listener {
             MinecraftServer server = ((CraftServer) Bukkit.getServer()).getServer();
             ServerLevel level = ((CraftWorld) world).getHandle();
 
-            // Build an offline-mode GameProfile with a random UUID
-            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
+            // Use provided profile (with fixed UUID + skin) or create a random one
+            GameProfile profile = providedProfile != null
+                    ? providedProfile
+                    : new GameProfile(UUID.randomUUID(), name);
 
-            // Create the ServerPlayer
-            // TODO: ClientInformation.createDefault() is the typical factory in 1.21.x.
-            //       If your Paper build names it differently, adjust here.
-            ServerPlayer bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
+            // Create the ServerPlayer with hurt() debug logging
+            final String botName = name;
+            ServerPlayer bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault()) {
+                @Override
+                public boolean hurtServer(ServerLevel lvl, DamageSource source, float amount) {
+                    logger.info("[DEBUG] hurtServer called on " + botName + ": source=" + source.type()
+                            + " amount=" + amount + " invulnerable=" + isInvulnerable()
+                            + " invulnerableTime=" + invulnerableTime);
+                    boolean result = super.hurtServer(lvl, source, amount);
+                    logger.info("[DEBUG] hurtServer result=" + result + " health=" + getHealth());
+                    return result;
+                }
+            };
 
-            // Position + look direction
-            bot.setPos(location.getX(), location.getY(), location.getZ());
-            bot.setYRot(location.getYaw());
-            bot.setXRot(location.getPitch());
-            bot.setYHeadRot(location.getYaw());
+            // Position + look direction (snapTo updates pos, rot, head rot, and bounding box)
+            bot.snapTo(location.getX(), location.getY(), location.getZ(), location.getYaw(), location.getPitch());
 
             // Build a CommonListenerCookie for the login handshake.
             // Paper 1.21.10 signature:
@@ -115,6 +132,11 @@ public class FakePlayerManager implements Listener {
             // tick() is no-op'd (prevents keepalive timeout disconnect).
             fakeConn.reattach(bot);
 
+            // Register the connection with the server's tick loop so
+            // NoOpPacketListener.tick() → doTick() → aiStep() → travel()
+            // runs every server tick, processing xxa/zza into real movement.
+            server.getConnection().getConnections().add(fakeConn.connection());
+
             // Ensure bot is in survival mode and hittable
             bot.setGameMode(GameType.SURVIVAL);
             bot.setInvulnerable(false);
@@ -122,12 +144,9 @@ public class FakePlayerManager implements Listener {
             // Mark as NPC so other plugins (TAB, Citizens-compat, etc.) skip this player
             bot.getBukkitEntity().setMetadata("NPC", new FixedMetadataValue(plugin, true));
 
-            // Re-position after placeNewPlayer via NMS setPos (no Bukkit events).
+            // Re-position after placeNewPlayer (snapTo updates tracker + bounding box).
             // placeNewPlayer sends the bot to world spawn; we force it back here.
-            bot.setPos(location.getX(), location.getY(), location.getZ());
-            bot.setYRot(location.getYaw());
-            bot.setXRot(location.getPitch());
-            bot.setYHeadRot(location.getYaw());
+            bot.snapTo(location.getX(), location.getY(), location.getZ(), location.getYaw(), location.getPitch());
 
             BotContext ctx = new BotContext(name, bot, fakeConn);
             activeBots.put(name, ctx);
@@ -219,17 +238,6 @@ public class FakePlayerManager implements Listener {
         }
     }
 
-    /**
-     * Block ALL teleport events for bots. We reposition bots using NMS
-     * setPos() which doesn't fire Bukkit events, so any teleport event
-     * reaching here is from an external plugin (Essentials, WorldGuard, etc.)
-     * and must be cancelled.
-     */
-    @EventHandler(priority = EventPriority.LOWEST)
-    public void onBotTeleport(PlayerTeleportEvent event) {
-        if (!isBot(event.getPlayer().getName())) return;
-        event.setCancelled(true);
-    }
 
     private static String formatLocation(Location loc) {
         return String.format("(%.1f, %.1f, %.1f) in %s",

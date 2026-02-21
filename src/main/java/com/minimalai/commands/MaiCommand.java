@@ -655,6 +655,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
                 return;
             }
             brain.setRecordingMode(recorder);
+            rewardComputer.registerBot(ctx.name());
             rewardComputer.registerRecorder(ctx.name(), recorder);
             activeRecordingBot = ctx.name();
 
@@ -851,9 +852,8 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
         sp.getBukkitEntity().getActivePotionEffects().forEach(
                 eff -> sp.getBukkitEntity().removePotionEffect(eff.getType()));
         sp.setDeltaMovement(0, 0, 0);
-        sp.setPos(x, y, z);
-        sp.setYRot(yaw);
-        sp.setXRot(0);
+        sp.snapTo(x, y, z, yaw, 0);
+
         if (selfPlay != null && selfPlay.kitName != null)
             kitManager.applyKit(sp, selfPlay.kitName);
         brain.setPaused(false);
@@ -907,9 +907,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
         sp.getBukkitEntity().getActivePotionEffects().forEach(
                 eff -> sp.getBukkitEntity().removePotionEffect(eff.getType()));
         sp.setDeltaMovement(0, 0, 0);
-        sp.setPos(duel.spawnLoc.getX(), duel.spawnLoc.getY(), duel.spawnLoc.getZ());
-        sp.setYRot(duel.spawnLoc.getYaw());
-        sp.setXRot(0);
+        sp.snapTo(duel.spawnLoc.getX(), duel.spawnLoc.getY(), duel.spawnLoc.getZ(), duel.spawnLoc.getYaw(), 0);
         if (duel.kitName != null) kitManager.applyKit(sp, duel.kitName);
 
         brain.resetEpisode();
@@ -955,7 +953,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
                 if (vBrain != null) {
                     vBrain.setPaused(true);
                     ServerPlayer sp = vBrain.getServerPlayer();
-                    sp.setPos(sp.getX(), sp.getY() + 100, sp.getZ());
+                    sp.snapTo(sp.getX(), sp.getY() + 100, sp.getZ(), sp.getYRot(), sp.getXRot());
                 }
                 selfPlay.deadBots.add(vName);
                 if (vTeam != null && selfPlay.isTeamWiped(vTeam)) resetRound();

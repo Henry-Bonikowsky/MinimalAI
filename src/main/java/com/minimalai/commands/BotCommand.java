@@ -87,11 +87,8 @@ public class BotCommand {
         org.bukkit.Bukkit.getScheduler().runTaskLater(
                 org.bukkit.Bukkit.getPluginManager().getPlugin("MinimalAI"),
                 () -> {
-                    // Reassert position via NMS (no Bukkit event)
-                    ctx.serverPlayer().setPos(loc.getX(), loc.getY(), loc.getZ());
-                    ctx.serverPlayer().setYRot(loc.getYaw());
-                    ctx.serverPlayer().setXRot(loc.getPitch());
-                    ctx.serverPlayer().setYHeadRot(loc.getYaw());
+                    // Reassert position via NMS (snapTo updates tracker + bounding box)
+                    ctx.serverPlayer().snapTo(loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
                     if (kitName != null) {
                         kitManager.applyKit(ctx.serverPlayer(), kitName);
                     }
