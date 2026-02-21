@@ -90,15 +90,14 @@ class VecPvPSim:
         # Combat config (constant across all envs)
         self.armor = 20
         self.sharpness = 6
-        self.prot_level = 5
-        prot_dr_per_piece = PROTECTION_DR_TABLE.get(self.prot_level, 0.0)
-        self.prot_mult = 1.0 - min(prot_dr_per_piece * 4, 100.0) / 100.0
-        self.armor_mult = (25 - self.armor) / 25.0
+        # Server direct damage uses simplified armor: DR = armor * 0.04, capped at 80%
+        self.armor_mult = 1.0 - min(self.armor * 0.04, 0.8)
 
         # Damage formula (pre-computed for standard loadout)
+        # No protection enchant DR (server direct damage doesn't apply it)
         self.base_dmg = BASE_SWORD_DAMAGE + SHARPNESS_PER_LEVEL * self.sharpness
-        self.base_dmg_after_armor = self.base_dmg * self.armor_mult * self.prot_mult
-        self.crit_dmg_after_armor = self.base_dmg * CRIT_MULTIPLIER * self.armor_mult * self.prot_mult
+        self.base_dmg_after_armor = self.base_dmg * self.armor_mult
+        self.crit_dmg_after_armor = self.base_dmg * CRIT_MULTIPLIER * self.armor_mult
 
     def reset_all(self) -> np.ndarray:
         """Reset all environments. Returns obs (n, OBS_DIM)."""
@@ -334,8 +333,8 @@ class VecPvPSim:
         dist = np.sqrt(dx**2 + dy**2 + dz**2)
         in_range = dist <= ATTACK_REACH
 
-        # I-frame check
-        can_hit = t_hurt_time <= (I_FRAME_TICKS // 2)
+        # I-frame check: server blocks ALL hits during i-frames
+        can_hit = t_hurt_time <= 0
 
         # Active mask: attacking AND in range AND can hit
         active = attack_mask & in_range & can_hit
@@ -359,43 +358,25 @@ class VecPvPSim:
         t_health[:] = np.maximum(0.0, t_health)
         t_hurt_time[active] = I_FRAME_TICKS
 
-        # Knockback (Kitara Advanced KB)
-        a_yaw_rad = np.radians(ayaw)
+        # Knockback (matching server binary sprint model)
+        # Server: kbStrength = sprintHit ? 0.9 : 0.4
+        # Direction: away from attacker (target - attacker normalized)
+        kb_dx = tx - ax
+        kb_dz = tz - az
+        kb_dist = np.sqrt(kb_dx**2 + kb_dz**2)
+        kb_dist = np.maximum(kb_dist, 0.001)  # avoid /0
+        kb_nx = kb_dx / kb_dist
+        kb_nz = kb_dz / kb_dist
 
-        if KB_HORIZONTAL_INHERIT:
-            mot_x = tvx * KB_HORIZONTAL_FRICTION + np.sin(a_yaw_rad) * -1.0
-            mot_z = tvz * KB_HORIZONTAL_FRICTION + np.cos(a_yaw_rad)
-        else:
-            mot_x = np.sin(a_yaw_rad) * -1.0
-            mot_z = np.cos(a_yaw_rad)
-
-        mot_x *= KB_HORIZONTAL
-        mot_z *= KB_HORIZONTAL
-        mot_y = np.full(n, KB_VERTICAL)
-
-        # Ground multiplier
-        ground_mask = active & t_on_ground
-        mot_x[ground_mask] *= KB_HORIZONTAL_ON_GROUND
-        mot_z[ground_mask] *= KB_HORIZONTAL_ON_GROUND
-        mot_y[ground_mask] *= KB_VERTICAL_ON_GROUND
-
-        # Sprint multiplier
         sprint_mask = active & a_sprint
-        mot_x[sprint_mask] *= KB_HORIZONTAL_SPRINTING
-        mot_z[sprint_mask] *= KB_HORIZONTAL_SPRINTING
-        mot_y[sprint_mask] *= KB_VERTICAL_SPRINTING
+        kb_strength = np.where(sprint_mask, 0.9, 0.4)
+        kb_y = np.full(n, 0.36)
 
-        # Apply KB to target
-        tvx[active] = mot_x[active]
-        tvy[active] = mot_y[active]
-        tvz[active] = mot_z[active]
+        # Apply KB additively to target velocity (matching server .add())
+        tvx[active] += (kb_nx * kb_strength)[active]
+        tvy[active] += kb_y[active]
+        tvz[active] += (kb_nz * kb_strength)[active]
         t_on_ground[active] = False
-
-        # Attacker slowdown
-        avx[sprint_mask] *= KB_SLOWDOWN
-        avz[sprint_mask] *= KB_SLOWDOWN
-        if KB_CANCEL_SPRINT:
-            a_sprint[sprint_mask] = False
 
         return damage
 
@@ -429,7 +410,7 @@ class VecPvPSim:
         whiff = attacking & (dist > ATTACK_REACH)
         rewards[whiff] -= 0.05
         # I-frame waste
-        iframe_waste = attacking & (dist <= ATTACK_REACH) & (self.b_hurt_time > (I_FRAME_TICKS // 2))
+        iframe_waste = attacking & (dist <= ATTACK_REACH) & (self.b_hurt_time > 0)
         rewards[iframe_waste] -= 0.03
 
         # Distance shaping: reward getting closer (potential-based)
