@@ -1,6 +1,7 @@
 package com.minimalai.bot;
 
 import com.mojang.authlib.GameProfile;
+import net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
@@ -147,6 +148,22 @@ public class FakePlayerManager implements Listener {
             // Re-position after placeNewPlayer (snapTo updates tracker + bounding box).
             // placeNewPlayer sends the bot to world spawn; we force it back here.
             bot.snapTo(location.getX(), location.getY(), location.getZ(), location.getYaw(), location.getPitch());
+
+            // Clear spawn invulnerability so the bot can be hit immediately
+            bot.invulnerableTime = 0;
+
+            // Sync the SGPLI's internal position tracking with the bot's actual
+            // position. Without this, handleInteract's distance check uses stale
+            // firstGoodX/Y/Z values from placeNewPlayer (world spawn).
+            bot.connection.resetPosition();
+
+            // Broadcast an immediate position sync packet to all tracking players
+            // so their clients see the bot at the correct position right away,
+            // eliminating the 1-2 tick desync window after spawn.
+            var tracked = level.getChunkSource().chunkMap.entityMap.get(bot.getId());
+            if (tracked != null) {
+                tracked.sendToTrackingPlayers(ClientboundEntityPositionSyncPacket.of(bot));
+            }
 
             BotContext ctx = new BotContext(name, bot, fakeConn);
             activeBots.put(name, ctx);

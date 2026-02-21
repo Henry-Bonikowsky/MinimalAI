@@ -16,6 +16,7 @@ import net.minecraft.server.network.CommonListenerCookie;
 import net.minecraft.server.network.ServerGamePacketListenerImpl;
 
 import java.net.InetSocketAddress;
+import java.util.function.Consumer;
 
 /**
  * No-op network plumbing for fake (bot) players.
@@ -96,7 +97,21 @@ public class FakeConnection {
         return packetListener;
     }
 
+    /**
+     * Set an optional packet capture callback on this connection's listener.
+     * Captured packets are passed to the consumer before being dropped.
+     * Used by ClaudeController to intercept title/actionbar/bossbar packets.
+     */
+    public void setPacketCapture(Consumer<Packet<?>> capture) {
+        if (packetListener instanceof NoOpPacketListener noop) {
+            noop.packetCapture = capture;
+        }
+    }
+
     private static class NoOpPacketListener extends ServerGamePacketListenerImpl {
+
+        volatile Consumer<Packet<?>> packetCapture;
+        private int tickCounter;
 
         public NoOpPacketListener(MinecraftServer server, Connection connection,
                                   ServerPlayer player, CommonListenerCookie cookie) {
@@ -110,17 +125,25 @@ public class FakeConnection {
             // effects, etc. Vanilla's aiStep() → travel() processes xxa/zza input,
             // gravity, knockback, and friction.
             this.player.doTick();
+
+            // Sync the SGPLI's internal position tracking (firstGoodX/Y/Z,
+            // lastGoodX/Y/Z) with the entity's actual position every 10 ticks.
+            // Without this, the anti-cheat distance check in handleInteract
+            // silently rejects attacks because it thinks the bot is elsewhere.
+            // (Same approach as fabric-carpet's EntityPlayerMPFake.)
+            if (++tickCounter % 10 == 0) {
+                this.resetPosition();
+            }
         }
 
         @Override
         public void send(Packet<?> packet) {
-            // Silently drop
+            if (packetCapture != null) packetCapture.accept(packet);
         }
 
         // Overload for packets with send listener (silently drop)
         public void send(Packet<?> packet, PacketSendListener listener) {
-            // Silently drop — the channel encoder no-ops already handle this,
-            // but this catches any direct calls with a PacketSendListener arg.
+            if (packetCapture != null) packetCapture.accept(packet);
         }
     }
 }
