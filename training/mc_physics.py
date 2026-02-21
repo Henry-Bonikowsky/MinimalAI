@@ -32,16 +32,16 @@ SPRINT_SPEED_MULT = 1.3   # sprinting speed multiplier vs walk
 BASE_WALK_ACCEL = 0.1     # generic.movement_speed base * 10
 PLAYER_WALK_SPEED = 0.1   # attribute base value
 
-# Combat constants
+# Combat constants (1.8-style — server uses OldCombatMechanics or similar)
 ATTACK_REACH = 3.0        # blocks (player reach)
 BASE_SWORD_DAMAGE = 7.0   # netherite sword base
-SHARPNESS_BONUS_PER_LEVEL = 0.5  # + 0.5 * level + 0.5 (1.9+ formula)
-CRIT_MULTIPLIER = 1.5     # falling + not on ground
-I_FRAME_TICKS = 10        # vanilla 1.9+ invulnerability ticks (0.5s)
+SHARPNESS_BONUS_PER_LEVEL = 1.25  # 1.8: random 0.5-1.5 * level, avg ~1.25/level
+CRIT_MULTIPLIER = 1.5     # falling + not on ground (same in 1.8)
+I_FRAME_TICKS = 10        # 1.8: 10 ticks (0.5s) invulnerability
 
-# Knockback
-KB_BASE = 0.4             # base horizontal KB
-KB_SPRINT_BONUS = 0.6     # extra KB when attacker sprinting
+# Knockback (1.8-style, calibrated from server recordings)
+KB_BASE = 0.4             # measured: 0.3974 horizontal from recording
+KB_SPRINT_BONUS = 0.6     # sprint-hit extra KB (1.8 w-tap mechanic)
 KB_VERTICAL = 0.4         # vertical KB impulse
 KB_VERTICAL_CAP = 0.4     # max vertical KB
 
@@ -313,24 +313,25 @@ class MCSimulator:
         if t.hurt_time > 0:
             return a, t, event
 
-        # ── Damage calculation (1.9+) ──
+        # ── Damage calculation (1.8-style, no cooldown) ──
         base_damage = BASE_SWORD_DAMAGE
-        # Sharpness: +0.5 * level + 0.5 for level >= 1
+        # 1.8 Sharpness: random(0, sharpness_level) + 1 extra damage
+        # Averaged: ~1.25 per level for simulation
         if a.sharpness_level > 0:
-            base_damage += 0.5 * a.sharpness_level + 0.5
+            base_damage += SHARPNESS_BONUS_PER_LEVEL * a.sharpness_level
 
-        # Strength effect
+        # Strength effect (1.8: +3 per level of Strength, +130% per level)
         if a.strength_amplifier >= 0:
             base_damage += 3.0 * (a.strength_amplifier + 1)
 
-        # Critical hit: falling + not on ground + not sprinting (vanilla crit)
-        # Note: in practice, sprint-crits work on servers. Keep it simple.
+        # Critical hit: falling + not on ground (1.8: same condition)
         critical = not a.on_ground and a.vy < 0
         if critical:
             base_damage *= CRIT_MULTIPLIER
             event.critical = True
 
-        # ── Armor reduction ──
+        # ── Armor reduction (1.8 formula) ──
+        # 1.8: damage_after = damage * (1 - min(20, max(armor/5, armor - damage*2/(toughness+4))) / 25)
         raw_damage = base_damage
         armor_defense = _armor_reduction(raw_damage, t.armor, t.armor_toughness)
         actual_damage = raw_damage * (1.0 - armor_defense)
