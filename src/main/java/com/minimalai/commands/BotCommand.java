@@ -35,6 +35,7 @@ public class BotCommand {
     private final @Nullable RewardComputer rewardComputer;
     private final @Nullable EpisodeManager episodeManager;
     private final KitManager kitManager;
+    private final List<String> defaultSigils;
 
     private final Map<String, BotBrain> brains = new ConcurrentHashMap<>();
     private @Nullable MaiCommand maiCommand;
@@ -47,7 +48,8 @@ public class BotCommand {
                       @Nullable ExperienceBuffer experienceBuffer,
                       @Nullable RewardComputer rewardComputer,
                       @Nullable EpisodeManager episodeManager,
-                      KitManager kitManager) {
+                      KitManager kitManager,
+                      List<String> defaultSigils) {
         this.botManager = botManager;
         this.modelManager = modelManager;
         this.obsBuilder = obsBuilder;
@@ -57,6 +59,7 @@ public class BotCommand {
         this.rewardComputer = rewardComputer;
         this.episodeManager = episodeManager;
         this.kitManager = kitManager;
+        this.defaultSigils = defaultSigils != null ? defaultSigils : Collections.emptyList();
     }
 
     public void setMaiCommand(MaiCommand cmd) {
@@ -80,30 +83,31 @@ public class BotCommand {
         BotContext ctx = botManager.spawn(world, location, name);
         if (ctx == null) return null;
 
-        // Delay kit + position reassert by 1 tick — placeNewPlayer triggers
-        // join-event processing where plugins may try to override inventory.
-        // Position is set via NMS setPos (no events) to avoid plugin interference.
+        // Phase 1 (tick+2): position reassert + sigil registration
         final Location loc = location;
-        org.bukkit.Bukkit.getScheduler().runTaskLater(
-                org.bukkit.Bukkit.getPluginManager().getPlugin("MinimalAI"),
-                () -> {
-                    // Reassert position via NMS (snapTo updates tracker + bounding box)
-                    ctx.serverPlayer().snapTo(loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
-                    if (kitName != null) {
-                        kitManager.applyKit(ctx.serverPlayer(), kitName);
-                    }
-                },
-                1L
-        );
+        var plugin = org.bukkit.Bukkit.getPluginManager().getPlugin("MinimalAI");
+        org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            ctx.serverPlayer().snapTo(loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
 
-        // Register virtual sigils so ArcaneSigils auto-procs them
-        if (sigilsApi != null && sigilsApi.isAvailable()) {
-            Player bukkitPlayer = ctx.serverPlayer().getBukkitEntity();
-            List<ArcaneSigilsAPI.SigilInfo> equipped = sigilsApi.getEquippedSigils(bukkitPlayer);
-            if (!equipped.isEmpty()) {
-                List<String> sigilIds = equipped.stream().map(ArcaneSigilsAPI.SigilInfo::id).toList();
-                sigilsApi.registerBotSigils(bukkitPlayer, sigilIds);
+            if (sigilsApi != null && sigilsApi.isAvailable()) {
+                List<String> sigils;
+                if (kitName != null) {
+                    sigils = kitManager.loadSigils(kitName);
+                } else {
+                    sigils = defaultSigils;
+                }
+                if (sigils != null && !sigils.isEmpty()) {
+                    sigilsApi.registerBotSigils(ctx.serverPlayer().getBukkitEntity(), sigils);
+                }
             }
+        }, 2L);
+
+        // Phase 2 (tick+10): apply kit AFTER all plugins finish join processing.
+        // ArcaneSigils gives default items on join; this overwrites them.
+        if (kitName != null) {
+            org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                kitManager.applyKit(ctx.serverPlayer(), kitName);
+            }, 10L);
         }
 
         try {
@@ -122,6 +126,14 @@ public class BotCommand {
                     episodeManager.startEpisode(ctx.name());
                 }
             }
+
+            // Anchor bot to spawn position so it stays in the arena
+            brain.setSpawnAnchor(
+                ctx.serverPlayer().getX(),
+                ctx.serverPlayer().getY(),
+                ctx.serverPlayer().getZ(),
+                15.0
+            );
 
             brains.put(ctx.name(), brain);
         } catch (Exception e) {

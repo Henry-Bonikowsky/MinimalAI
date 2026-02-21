@@ -236,7 +236,6 @@ public class ActionExecutor {
         boolean inRange = dist <= MELEE_REACH;
 
         if (!inRange) {
-            // Whiff: attack action fired but out of range
             if (rewardCtx != null && rewardBotName != null) {
                 rewardCtx.onBotAttack(rewardBotName, false, false);
             }
@@ -253,7 +252,6 @@ public class ActionExecutor {
             double lookZ = Math.cos(yawRad);
             double dot = (lookX * dx + lookZ * dz) / horizDist;
             if (dot < MELEE_ANGLE_COS) {
-                // Whiff: facing wrong direction
                 if (rewardCtx != null && rewardBotName != null) {
                     rewardCtx.onBotAttack(rewardBotName, false, false);
                 }
@@ -261,12 +259,77 @@ public class ActionExecutor {
             }
         }
 
-        // Check i-frame waste before attacking
-        boolean iFrameWaste = target.invulnerableTime > 0;
-        bot.attack(target); // vanilla damage calc, knockback, crits
+        // I-frame check: skip damage if target was recently hit
+        if (target.invulnerableTime > 0) {
+            if (rewardCtx != null && rewardBotName != null) {
+                rewardCtx.onBotAttack(rewardBotName, false, true);
+            }
+            return;
+        }
+
+        float baseDmg = (float) bot.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.ATTACK_DAMAGE);
+        float preHp = target.getHealth() + target.getAbsorptionAmount();
+
+        // Direct damage: server's damage event pipeline is blocked for fake players
+        // (plugin listeners cancel EntityDamageByEntityEvent), so we apply damage manually.
+        float dmg = baseDmg;
+        // Armor reduction (simplified): DR = armor * 0.04, capped at 80%
+        if (target instanceof ServerPlayer tp) {
+            float armor = (float) tp.getArmorValue();
+            float reduction = Math.min(armor * 0.04f, 0.8f);
+            dmg *= (1.0f - reduction);
+        }
+        // Crit bonus: if bot is falling
+        if (bot.fallDistance > 0 && !bot.onGround()) {
+            dmg *= 1.5f;
+        }
+        // Sprint knockback bonus
+        boolean sprintHit = bot.isSprinting();
+        // Apply to absorption first, then health
+        float absorption = target.getAbsorptionAmount();
+        if (absorption > 0) {
+            float absorbDmg = Math.min(absorption, dmg);
+            target.setAbsorptionAmount(absorption - absorbDmg);
+            dmg -= absorbDmg;
+        }
+        if (dmg > 0) {
+            float newHealth = target.getHealth() - dmg;
+            // Kill threshold: if health would drop below 1.0, force death
+            // Prevents near-death stalemates where armor reduction asymptotically approaches 0
+            if (newHealth < 1.0f) newHealth = 0;
+            target.setHealth(Math.max(0, newHealth));
+        }
+        // Force death state if health reached 0 (setHealth(0) alone doesn't kill)
+        if (target.getHealth() <= 0) {
+            try {
+                java.lang.reflect.Field deadField =
+                    net.minecraft.world.entity.LivingEntity.class.getDeclaredField("dead");
+                deadField.setAccessible(true);
+                deadField.setBoolean(target, true);
+            } catch (Exception ignored) {}
+        }
+        // Apply knockback (away from attacker)
+        double kbX = target.getX() - bot.getX();
+        double kbZ = target.getZ() - bot.getZ();
+        double kbDist = Math.sqrt(kbX * kbX + kbZ * kbZ);
+        if (kbDist > 0.001) {
+            double kbStrength = sprintHit ? 0.9 : 0.4;
+            target.setDeltaMovement(
+                target.getDeltaMovement().add(kbX / kbDist * kbStrength, 0.36, kbZ / kbDist * kbStrength)
+            );
+        }
+        // Set hurt animation + i-frames
+        target.invulnerableTime = 10;
+        target.hurtDuration = 10;
+        target.hurtTime = 10;
+        float postHp = target.getHealth() + target.getAbsorptionAmount();
+        float dealt = Math.max(0, preHp - postHp);
 
         if (rewardCtx != null && rewardBotName != null) {
-            rewardCtx.onBotAttack(rewardBotName, true, iFrameWaste);
+            rewardCtx.onBotAttack(rewardBotName, dealt > 0, false);
+            if (dealt > 0) {
+                rewardCtx.notifyDamageDealt(rewardBotName, dealt);
+            }
         }
     }
 

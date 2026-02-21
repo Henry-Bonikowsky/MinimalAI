@@ -51,6 +51,18 @@ public class BotBrain {
     private boolean paused = false;
     private Set<UUID> allyUUIDs = Set.of();
 
+    // Arena boundary enforcement: teleport back if bot strays too far
+    private double spawnX, spawnY, spawnZ;
+    private double arenaRadius = 30.0; // max distance from spawn before teleport
+    private boolean hasSpawnAnchor = false;
+
+    // Engagement: force approach if idle too long (prevents sim-to-real stalemates)
+    private int idleTicks = 0;
+    private int forceEngageTicks = 0; // countdown of forced engagement
+    private float lastCombatHealth = -1;
+    private static final int IDLE_THRESHOLD = 60; // 3 seconds without health change
+    private static final int FORCE_ENGAGE_DURATION = 100; // force approach for 5 seconds
+
     // Physics recording mode (random actions, no model needed)
     private @Nullable PhysicsRecorder physicsRecorder;
     private boolean recordingMode = false;
@@ -103,9 +115,45 @@ public class BotBrain {
      * In recording mode, uses random actions and logs physics data.
      * Called from the server tick scheduler.
      */
+    // Respawn cooldown (ticks to wait after death before respawning)
+    private int respawnCooldown = 0;
+    private static final int RESPAWN_DELAY_TICKS = 20; // 1 second
+
     public void tick() {
         if (paused) return;
-        if (!bot.isAlive()) return;
+
+        // Auto-respawn: when dead or dying, wait a cooldown then reset
+        if (bot.isDeadOrDying() || bot.isRemoved()) {
+            if (respawnCooldown <= 0) {
+                respawnCooldown = RESPAWN_DELAY_TICKS;
+            }
+            // Prevent entity removal while waiting to respawn (vanilla removes after 20 ticks)
+            bot.deathTime = 0;
+            respawnCooldown--;
+            if (respawnCooldown <= 0) {
+                respawnBot();
+            }
+            return;
+        }
+
+        // Ensure bot is hittable (not globally invulnerable)
+        bot.setInvulnerable(false);
+        bot.setClientLoaded(true);
+        // Note: invulnerableTime is NOT cleared here — it provides i-frame protection
+        // between hits and is naturally decremented by LivingEntity.tick() each tick
+
+        // Arena boundary enforcement: teleport back if too far from spawn
+        if (hasSpawnAnchor) {
+            double dx = bot.getX() - spawnX;
+            double dz = bot.getZ() - spawnZ;
+            double horizDist = Math.sqrt(dx * dx + dz * dz);
+            if (horizDist > arenaRadius || bot.getY() < spawnY - 5) {
+                bot.snapTo(spawnX, spawnY, spawnZ, bot.getYRot(), bot.getXRot());
+                bot.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
+                bot.fallDistance = 0;
+                target = null; // re-acquire target after teleport
+            }
+        }
 
         // Recording mode: random actions + physics logging, no model needed
         if (recordingMode && physicsRecorder != null) {
@@ -157,6 +205,32 @@ public class BotBrain {
 
             // 4. Sample actions from probabilities with mask
             int[] actions = sampleActions(result.actionProbs, actionMask);
+
+            // 4.5. Anti-idle: force approach when stalemate detected
+            float currentHealth = bot.getHealth() + bot.getAbsorptionAmount();
+            float targetHealth = target instanceof LivingEntity le ? le.getHealth() + le.getAbsorptionAmount() : 0;
+            float combinedHealth = currentHealth + targetHealth;
+            if (lastCombatHealth < 0) lastCombatHealth = combinedHealth;
+            if (Math.abs(combinedHealth - lastCombatHealth) > 0.5f) {
+                idleTicks = 0;
+                lastCombatHealth = combinedHealth;
+            } else {
+                idleTicks++;
+            }
+            if (idleTicks > IDLE_THRESHOLD && target != null) {
+                forceEngageTicks = FORCE_ENGAGE_DURATION;
+                idleTicks = 0;
+            }
+            if (forceEngageTicks > 0) {
+                forceEngageTicks--;
+                // Override actions: sprint toward target and attack
+                actions[ActionSpace.ACT_FORWARD] = 1;
+                actions[ActionSpace.ACT_BACKWARD] = 0;
+                actions[ActionSpace.ACT_SPRINT] = 1;
+                actions[ActionSpace.ACT_FACE_TARGET] = 1;
+                actions[ActionSpace.ACT_ATTACK] = 1;
+                actions[ActionSpace.ACT_JUMP] = bot.onGround() && ThreadLocalRandom.current().nextFloat() < 0.15f ? 1 : 0;
+            }
 
             // 5. Execute actions (with reward callbacks if training)
             LivingEntity newTarget = actionExecutor.execute(
@@ -248,6 +322,53 @@ public class BotBrain {
     public void resetEpisode() {
         hidden = new float[ObservationSpace.HIDDEN_DIM];
         target = null;
+        idleTicks = 0;
+        forceEngageTicks = 0;
+        lastCombatHealth = -1;
+    }
+
+    /**
+     * Respawn the bot: restore health, teleport to spawn, reset episode state.
+     * Resets NMS death state so the entity is considered alive again.
+     */
+    private void respawnBot() {
+        // Reset NMS death state (dead is protected, use reflection)
+        try {
+            java.lang.reflect.Field deadField = net.minecraft.world.entity.LivingEntity.class.getDeclaredField("dead");
+            deadField.setAccessible(true);
+            deadField.setBoolean(bot, false);
+        } catch (Exception ignored) {}
+        bot.deathTime = 0;
+
+        // Restore health
+        bot.setHealth(bot.getMaxHealth());
+        bot.setAbsorptionAmount(0);
+
+        // Clear damage/invulnerability state
+        bot.invulnerableTime = 0;
+        bot.hurtTime = 0;
+        bot.hurtDuration = 0;
+        bot.fallDistance = 0;
+        bot.setDeltaMovement(net.minecraft.world.phys.Vec3.ZERO);
+
+        // Teleport to spawn anchor
+        if (hasSpawnAnchor) {
+            bot.snapTo(spawnX, spawnY, spawnZ, bot.getYRot(), bot.getXRot());
+        }
+
+        // Reapply kit: golden apples are consumed during fights
+        org.bukkit.inventory.PlayerInventory inv = bot.getBukkitEntity().getInventory();
+        inv.clear();
+        inv.setItem(0, new org.bukkit.inventory.ItemStack(org.bukkit.Material.DIAMOND_SWORD, 1));
+        inv.setItem(1, new org.bukkit.inventory.ItemStack(org.bukkit.Material.GOLDEN_APPLE, 64));
+        inv.setHelmet(new org.bukkit.inventory.ItemStack(org.bukkit.Material.DIAMOND_HELMET, 1));
+        inv.setChestplate(new org.bukkit.inventory.ItemStack(org.bukkit.Material.DIAMOND_CHESTPLATE, 1));
+        inv.setLeggings(new org.bukkit.inventory.ItemStack(org.bukkit.Material.DIAMOND_LEGGINGS, 1));
+        inv.setBoots(new org.bukkit.inventory.ItemStack(org.bukkit.Material.DIAMOND_BOOTS, 1));
+        inv.setHeldItemSlot(0);
+
+        // Reset AI state for new episode
+        resetEpisode();
     }
 
     public void setTrainingComponents(ExperienceBuffer buffer, RewardComputer rewards) {
@@ -285,6 +406,18 @@ public class BotBrain {
 
     public void setAllies(Set<UUID> allies) {
         this.allyUUIDs = allies;
+    }
+
+    /**
+     * Set the bot's spawn anchor point. If the bot moves more than arenaRadius
+     * blocks away (horizontal) or falls below spawnY - 5, it gets teleported back.
+     */
+    public void setSpawnAnchor(double x, double y, double z, double radius) {
+        this.spawnX = x;
+        this.spawnY = y;
+        this.spawnZ = z;
+        this.arenaRadius = radius;
+        this.hasSpawnAnchor = true;
     }
 
     // ----------------------------------------------------------------
