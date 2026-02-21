@@ -1,11 +1,17 @@
 package com.minimalai.training;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.effect.MobEffect;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
@@ -58,7 +64,12 @@ public class PhysicsRecorder implements AutoCloseable {
             // Relative to target
             "target_dist,target_dx,target_dy,target_dz," +
             // Environment
-            "block_friction";
+            "block_friction," +
+            // Enhanced physics columns (appended for backward compat)
+            "pre_horizontal_collision,pre_vertical_collision,pre_fall_distance," +
+            "pre_speed_amplifier,pre_strength_amplifier,pre_sharpness_level," +
+            "tgt_sharpness_level,hit_attacker_sprinting," +
+            "post_horizontal_collision,post_fall_distance";
 
     private final BufferedWriter writer;
     private final Path filePath;
@@ -71,6 +82,19 @@ public class PhysicsRecorder implements AutoCloseable {
     // Velocity at the moment damage was received (before knockback is applied)
     private double hitVelX = 0, hitVelY = 0, hitVelZ = 0;
     private boolean wasHitThisTick = false;
+    private boolean attackerSprinting = false;
+
+    // --- 1-tick buffer for correct post-state capture ---
+    // doTick() (physics) runs between BotBrain.tick() calls, so next tick's
+    // pre-state is the true post-state of the current tick.
+    private boolean hasPrevTick = false;
+    private StateSnapshot bufferedPre;
+    private int[] bufferedActions;
+    private float bufferedBlockFriction;
+    private String bufferedBotName;
+    private @Nullable TargetSnapshot bufferedTargetSnap;
+    private double bufferedRelDist, bufferedRelDx, bufferedRelDy, bufferedRelDz;
+    private boolean bufferedHasTarget;
 
     public PhysicsRecorder(Path outputFile) throws IOException {
         this.filePath = outputFile;
@@ -94,7 +118,12 @@ public class PhysicsRecorder implements AutoCloseable {
             int hurtTime,
             float attackCooldown,
             int armor, float armorToughness,
-            int heldItemType  // 0=sword, 1=axe, 2=other
+            int heldItemType,  // 0=sword, 1=axe, 2=other
+            // Enhanced physics fields
+            boolean horizontalCollision, boolean verticalCollision,
+            float fallDistance,
+            int speedAmplifier, int strengthAmplifier,
+            int sharpnessLevel
     ) {
         public static StateSnapshot capture(ServerPlayer bot) {
             Vec3 vel = bot.getDeltaMovement();
@@ -108,7 +137,12 @@ public class PhysicsRecorder implements AutoCloseable {
                     bot.hurtTime,
                     bot.getAttackStrengthScale(0.5f),
                     bot.getArmorValue(), getArmorToughness(bot),
-                    classifyWeapon(bot.getMainHandItem())
+                    classifyWeapon(bot.getMainHandItem()),
+                    bot.horizontalCollision, bot.verticalCollision,
+                    (float) bot.fallDistance,
+                    getEffectAmplifier(bot, MobEffects.SPEED),
+                    getEffectAmplifier(bot, MobEffects.STRENGTH),
+                    getSharpnessLevel(bot.getMainHandItem(), bot)
             );
         }
     }
@@ -125,12 +159,12 @@ public class PhysicsRecorder implements AutoCloseable {
             int hurtTime,
             int armor, float armorToughness,
             int heldItemType,
-            float attackCooldown
+            float attackCooldown,
+            int sharpnessLevel
     ) {
         public static TargetSnapshot capture(LivingEntity target) {
             Vec3 vel = target.getDeltaMovement();
             float cooldown = (target instanceof Player p) ? p.getAttackStrengthScale(0.5f) : 1.0f;
-            int food = -1; // only available for players
             return new TargetSnapshot(
                     target.getX(), target.getY(), target.getZ(),
                     vel.x, vel.y, vel.z,
@@ -140,27 +174,89 @@ public class PhysicsRecorder implements AutoCloseable {
                     target.hurtTime,
                     target.getArmorValue(), getArmorToughness(target),
                     classifyWeapon(target.getMainHandItem()),
-                    cooldown
+                    cooldown,
+                    getSharpnessLevel(target.getMainHandItem(), target)
             );
         }
     }
 
     /**
-     * Record one tick of full physics + combat data.
+     * Record one tick using a 1-tick buffer for correct post-state capture.
      *
-     * @param botName     bot identifier
-     * @param pre         bot state BEFORE action execution
-     * @param post        bot state AFTER action execution
-     * @param actions     the 35-element action vector
-     * @param target      the combat target (nullable)
-     * @param botPlayer   the bot's ServerPlayer (for relative calculations)
-     * @param blockFriction friction value of the block below the bot
+     * doTick() (which processes xxa/zza into actual movement) runs between
+     * BotBrain.tick() calls, so next tick's pre-state is the true post-state
+     * of the current tick. This method buffers each tick and writes the
+     * previous tick's row when the next tick arrives.
+     *
+     * Combat accumulators (dmgDealt, dmgTaken, hitVel) collect events that
+     * fire between ticks (from doTick processing attacks), so they correctly
+     * belong to the row being written.
+     *
+     * @param botName       bot identifier
+     * @param currentState  bot state captured NOW (before this tick's actions)
+     * @param actions       the action vector being applied this tick
+     * @param target        combat target (nullable)
+     * @param botPlayer     the bot's ServerPlayer
+     * @param blockFriction friction of block below bot
      */
-    public void record(String botName, StateSnapshot pre, StateSnapshot post,
-                       int[] actions, @Nullable LivingEntity target,
-                       ServerPlayer botPlayer, float blockFriction) {
+    public void recordTick(String botName, StateSnapshot currentState, int[] actions,
+                           @Nullable LivingEntity target, ServerPlayer botPlayer,
+                           float blockFriction) {
         if (closed) return;
 
+        if (hasPrevTick) {
+            // Write previous tick's row: post-state = this tick's pre-state
+            // Combat accumulators contain events from between previous and current tick
+            writeRow(bufferedBotName, bufferedPre, currentState, bufferedActions,
+                     bufferedHasTarget, bufferedTargetSnap,
+                     bufferedRelDist, bufferedRelDx, bufferedRelDy, bufferedRelDz,
+                     bufferedBlockFriction);
+        }
+
+        // Buffer current tick data
+        bufferedPre = currentState;
+        bufferedActions = actions.clone();
+        bufferedBlockFriction = blockFriction;
+        bufferedBotName = botName;
+
+        // Capture target snapshot NOW (at pre-state time)
+        if (target != null && target.isAlive()) {
+            bufferedTargetSnap = TargetSnapshot.capture(target);
+            double dx = target.getX() - botPlayer.getX();
+            double dy = target.getY() - botPlayer.getY();
+            double dz = target.getZ() - botPlayer.getZ();
+            bufferedRelDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            bufferedRelDx = dx;
+            bufferedRelDy = dy;
+            bufferedRelDz = dz;
+            bufferedHasTarget = true;
+        } else {
+            bufferedTargetSnap = null;
+            bufferedRelDist = bufferedRelDx = bufferedRelDy = bufferedRelDz = 0;
+            bufferedHasTarget = false;
+        }
+
+        hasPrevTick = true;
+    }
+
+    /**
+     * Flush the last buffered tick. Call before close() to avoid losing
+     * the final tick. Captures one more snapshot as the post-state.
+     */
+    public void flush(ServerPlayer bot) {
+        if (!hasPrevTick || closed) return;
+        StateSnapshot finalState = StateSnapshot.capture(bot);
+        writeRow(bufferedBotName, bufferedPre, finalState, bufferedActions,
+                 bufferedHasTarget, bufferedTargetSnap,
+                 bufferedRelDist, bufferedRelDx, bufferedRelDy, bufferedRelDz,
+                 bufferedBlockFriction);
+        hasPrevTick = false;
+    }
+
+    private void writeRow(String botName, StateSnapshot pre, StateSnapshot post,
+                          int[] actions, boolean hasTarget, @Nullable TargetSnapshot tgt,
+                          double relDist, double relDx, double relDy, double relDz,
+                          float blockFriction) {
         try {
             StringBuilder sb = new StringBuilder(1024);
 
@@ -183,13 +279,12 @@ public class PhysicsRecorder implements AutoCloseable {
             sb.append(actions[9]).append(',');  // eat gap
             sb.append(actions[12]).append(','); // sprint reset
 
-            // Post-action bot state (subset: position, velocity, health, hurtTime)
+            // Post-action bot state (now from NEXT tick's pre-state = true post-physics)
             appendPostState(sb, post);
 
-            // Combat events
+            // Combat events (from accumulators: events between prev and current tick)
             sb.append(fmt(dmgDealt)).append(',');
             sb.append(fmt(dmgTaken)).append(',');
-            // Velocity at the moment of being hit (before KB is applied by vanilla)
             if (wasHitThisTick) {
                 sb.append(fmt(hitVelX)).append(',');
                 sb.append(fmt(hitVelY)).append(',');
@@ -198,36 +293,48 @@ public class PhysicsRecorder implements AutoCloseable {
                 sb.append(",,,");
             }
 
-            // Target state
-            if (target != null && target.isAlive()) {
-                TargetSnapshot tgt = TargetSnapshot.capture(target);
+            // Target state (captured at pre-state time)
+            if (hasTarget && tgt != null) {
                 appendTargetState(sb, tgt);
-
-                // Relative position
-                double dx = target.getX() - botPlayer.getX();
-                double dy = target.getY() - botPlayer.getY();
-                double dz = target.getZ() - botPlayer.getZ();
-                double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                sb.append(fmt(dist)).append(',');
-                sb.append(fmt(dx)).append(',');
-                sb.append(fmt(dy)).append(',');
-                sb.append(fmt(dz)).append(',');
+                sb.append(fmt(relDist)).append(',');
+                sb.append(fmt(relDx)).append(',');
+                sb.append(fmt(relDy)).append(',');
+                sb.append(fmt(relDz)).append(',');
             } else {
                 // 22 empty target fields + 4 relative fields
                 sb.append(",".repeat(22));
             }
 
             // Environment: block friction
-            sb.append(fmt(blockFriction));
+            sb.append(fmt(blockFriction)).append(',');
 
-            writer.write(sb.toString());
-            writer.newLine();
+            // Enhanced physics columns
+            sb.append(pre.horizontalCollision() ? 1 : 0).append(',');
+            sb.append(pre.verticalCollision() ? 1 : 0).append(',');
+            sb.append(fmt(pre.fallDistance())).append(',');
+            sb.append(pre.speedAmplifier()).append(',');
+            sb.append(pre.strengthAmplifier()).append(',');
+            sb.append(pre.sharpnessLevel()).append(',');
+            // Target sharpness
+            if (hasTarget && tgt != null) {
+                sb.append(tgt.sharpnessLevel());
+            }
+            sb.append(',');
+            // Hit attacker sprinting (from combat accumulator)
+            sb.append(wasHitThisTick && attackerSprinting ? 1 : 0).append(',');
+            // Post-state collision + fall distance
+            sb.append(post.horizontalCollision() ? 1 : 0).append(',');
+            sb.append(fmt(post.fallDistance()));
 
-            // Reset per-tick accumulators
+            // Reset combat accumulators
             dmgDealt = 0f;
             dmgTaken = 0f;
             hitVelX = hitVelY = hitVelZ = 0;
             wasHitThisTick = false;
+            attackerSprinting = false;
+
+            writer.write(sb.toString());
+            writer.newLine();
 
         } catch (IOException e) {
             LOG.warning("[PhysicsRecorder] Write error: " + e.getMessage());
@@ -242,13 +349,17 @@ public class PhysicsRecorder implements AutoCloseable {
     /**
      * Called from damage event listeners when bot takes damage.
      * Velocity here is BEFORE knockback is applied (event fires before vanilla KB).
+     *
+     * @param attackerWasSprinting whether the attacker was sprinting at hit time (affects KB)
      */
-    public void onDamageTaken(float amount, double velX, double velY, double velZ) {
+    public void onDamageTaken(float amount, double velX, double velY, double velZ,
+                              boolean attackerWasSprinting) {
         dmgTaken += amount;
         hitVelX = velX;
         hitVelY = velY;
         hitVelZ = velZ;
         wasHitThisTick = true;
+        this.attackerSprinting = attackerWasSprinting;
     }
 
     public int getTickCount() {
@@ -359,6 +470,24 @@ public class PhysicsRecorder implements AutoCloseable {
     private static float getArmorToughness(LivingEntity entity) {
         var inst = entity.getAttribute(Attributes.ARMOR_TOUGHNESS);
         return inst != null ? (float) inst.getValue() : 0f;
+    }
+
+    /** Get the amplifier of a mob effect on an entity, or -1 if not present. */
+    private static int getEffectAmplifier(LivingEntity entity, Holder<MobEffect> effect) {
+        MobEffectInstance inst = entity.getEffect(effect);
+        return inst != null ? inst.getAmplifier() : -1;
+    }
+
+    /** Get the sharpness enchantment level on a weapon, or 0 if absent. */
+    private static int getSharpnessLevel(ItemStack stack, LivingEntity entity) {
+        if (stack.isEmpty()) return 0;
+        try {
+            var registry = entity.level().registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+            var holder = registry.getOrThrow(Enchantments.SHARPNESS);
+            return stack.getEnchantments().getLevel(holder);
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     /**

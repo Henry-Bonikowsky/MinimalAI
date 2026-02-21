@@ -132,6 +132,21 @@ public class RewardComputer implements Listener {
         recorders.remove(name);
     }
 
+    /**
+     * Direct damage notification — bypasses Bukkit event system which may not
+     * fire for NMS-level bot.attack() calls on fake players.
+     */
+    public void notifyDamageDealt(String botName, float amount) {
+        PhysicsRecorder rec = recorders.get(botName);
+        if (rec != null) rec.onDamageDealt(amount);
+    }
+
+    public void notifyDamageTaken(String botName, float amount, double vx, double vy, double vz,
+                                  boolean attackerSprinting) {
+        PhysicsRecorder rec = recorders.get(botName);
+        if (rec != null) rec.onDamageTaken(amount, vx, vy, vz, attackerSprinting);
+    }
+
     // ----------------------------------------------------------------
     //  Bukkit event handlers
     // ----------------------------------------------------------------
@@ -162,12 +177,12 @@ public class RewardComputer implements Listener {
             }
             PhysicsRecorder rec = recorders.get(victim.getName());
             if (rec != null) {
-                // Extract knockback from the velocity change
-                Player victimPlayer = victim;
+                boolean attackerSprinting = e.getDamager() instanceof Player p && p.isSprinting();
                 rec.onDamageTaken(taken,
-                        victimPlayer.getVelocity().getX(),
-                        victimPlayer.getVelocity().getY(),
-                        victimPlayer.getVelocity().getZ());
+                        victim.getVelocity().getX(),
+                        victim.getVelocity().getY(),
+                        victim.getVelocity().getZ(),
+                        attackerSprinting);
             }
         }
     }

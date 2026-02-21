@@ -54,6 +54,7 @@ public class BotBrain {
     // Physics recording mode (random actions, no model needed)
     private @Nullable PhysicsRecorder physicsRecorder;
     private boolean recordingMode = false;
+    private float prevBotHealth = -1; // for direct damage-taken tracking
 
     // Random action probabilities for recording mode
     private static final float[] RANDOM_PROBS = {
@@ -309,6 +310,9 @@ public class BotBrain {
     /**
      * Recording tick: random actions + physics data logging.
      * No model inference needed — actions are sampled from fixed probabilities.
+     *
+     * Uses buffered recording: this tick's pre-state becomes the previous
+     * tick's post-state (since doTick/physics runs between tick() calls).
      */
     private void tickRecording() {
         try {
@@ -317,30 +321,32 @@ public class BotBrain {
                 target = findNearestEnemy();
             }
 
-            // Capture pre-action state (full snapshot with health, armor, etc.)
-            PhysicsRecorder.StateSnapshot pre = PhysicsRecorder.StateSnapshot.capture(bot);
-
-            // Get block friction below bot
+            // Capture current state (before this tick's actions execute)
+            PhysicsRecorder.StateSnapshot currentState = PhysicsRecorder.StateSnapshot.capture(bot);
             float blockFriction = PhysicsRecorder.getBlockFriction(bot);
 
-            // Build action mask
+            // Direct damage-taken tracking via health comparison
+            float curHealth = bot.getHealth() + bot.getAbsorptionAmount();
+            if (prevBotHealth >= 0 && curHealth < prevBotHealth) {
+                float taken = prevBotHealth - curHealth;
+                net.minecraft.world.phys.Vec3 vel = bot.getDeltaMovement();
+                physicsRecorder.onDamageTaken(taken, vel.x, vel.y, vel.z, false);
+            }
+            prevBotHealth = curHealth;
+
+            // Build action mask and sample random actions
             List<LivingEntity> nearby = getNearbyEntities();
             float[] actionMask = actionExecutor.buildActionMask(bot, nearby.size());
-
-            // Sample random actions from fixed probabilities with mask
             int[] actions = sampleActions(RANDOM_PROBS, actionMask);
 
-            // Execute actions
+            // Execute actions (sets xxa/zza for doTick to process between ticks)
             LivingEntity newTarget = actionExecutor.execute(bot, actions, target, nearby);
             if (newTarget != null) {
                 target = newTarget;
             }
 
-            // Capture post-action state
-            PhysicsRecorder.StateSnapshot post = PhysicsRecorder.StateSnapshot.capture(bot);
-
-            // Record the tick with full state
-            physicsRecorder.record(name, pre, post, actions, target, bot, blockFriction);
+            // Record tick (buffered: this tick's pre becomes last tick's post)
+            physicsRecorder.recordTick(name, currentState, actions, target, bot, blockFriction);
 
         } catch (Exception e) {
             LOG.warning("Recording tick error for '" + name + "': " + e.getMessage());
@@ -350,6 +356,7 @@ public class BotBrain {
     public void close() {
         try {
             if (physicsRecorder != null) {
+                physicsRecorder.flush(bot);
                 physicsRecorder.close();
             }
             predictor.close();
