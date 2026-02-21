@@ -12,8 +12,10 @@ import com.minimalai.training.RewardComputer;
 import com.minimalai.training.TrainingClient;
 
 import net.minecraft.server.level.ServerPlayer;
+import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -421,8 +423,29 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
     }
 
     private void handleBotSpawn(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player)) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Only players can spawn bots.");
+        Location loc;
+        if (sender instanceof Player player) {
+            loc = player.getLocation();
+        } else {
+            // Console/RCON: spawn <name> <world> <x> <y> <z> [model] [kit]
+            if (args.length < 6) {
+                sender.sendMessage(PREFIX + ChatColor.RED + "Console usage: /mai bot spawn <name> <world> <x> <y> <z> [model] [kit]");
+                return;
+            }
+            World w = Bukkit.getWorld(args[2]);
+            if (w == null) { sender.sendMessage(PREFIX + ChatColor.RED + "World '" + args[2] + "' not found."); return; }
+            try {
+                loc = new Location(w, Double.parseDouble(args[3]), Double.parseDouble(args[4]), Double.parseDouble(args[5]));
+            } catch (NumberFormatException e) {
+                sender.sendMessage(PREFIX + ChatColor.RED + "Invalid coordinates."); return;
+            }
+            String cName = args[1];
+            String cModel = args.length >= 7 ? args[6] : defaultModel;
+            String cKit = args.length >= 8 ? args[7] : defaultKit;
+            if (cKit != null && !kitManager.listKits().contains(cKit)) cKit = null;
+            BotContext ctx = botCmd.spawnBot(w, loc, cName, cModel, cKit);
+            if (ctx == null) { sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot."); return; }
+            sender.sendMessage(PREFIX + ChatColor.GREEN + "Spawned '" + ctx.name() + "'.");
             return;
         }
         // Positional: spawn [name] [model] [kit]
@@ -435,7 +458,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
             kitName = null;
         }
 
-        BotContext ctx = botCmd.spawnBot(player.getWorld(), player.getLocation(), name, modelName, kitName);
+        BotContext ctx = botCmd.spawnBot(loc.getWorld(), loc, name, modelName, kitName);
         if (ctx == null) {
             sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot. Load a model first.");
             return;
@@ -474,9 +497,13 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
         sender.sendMessage(PREFIX + ChatColor.GREEN + "Active bots (" + bots.size() + "):");
         for (BotContext ctx : bots) {
             Location loc = ctx.bukkitLocation();
-            boolean hasBrain = botCmd.getBrains().containsKey(ctx.name());
+            BotBrain brain = botCmd.getBrains().get(ctx.name());
+            String status = brain != null ? ChatColor.GREEN + " [AI]" : ChatColor.RED + " [idle]";
+            String hp = String.format("%.1f", ctx.serverPlayer().getHealth());
+            String deaths = brain != null ? String.valueOf(brain.getDeaths()) : "?";
             sender.sendMessage(ChatColor.GRAY + "  - " + ChatColor.WHITE + ctx.name()
-                    + (hasBrain ? ChatColor.GREEN + " [AI]" : ChatColor.RED + " [idle]")
+                    + status + ChatColor.GRAY + " HP:" + ChatColor.YELLOW + hp
+                    + ChatColor.GRAY + " Deaths:" + ChatColor.YELLOW + deaths
                     + ChatColor.GRAY + " at " + String.format("%.0f, %.0f, %.0f", loc.getX(), loc.getY(), loc.getZ()));
         }
     }

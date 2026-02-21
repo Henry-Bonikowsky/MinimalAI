@@ -119,6 +119,11 @@ public class BotBrain {
     private int respawnCooldown = 0;
     private static final int RESPAWN_DELAY_TICKS = 20; // 1 second
 
+    // Kill statistics
+    private int deaths = 0;
+    private int ticksAlive = 0;
+    private static final int STATS_LOG_INTERVAL = 6000; // log stats every 5 minutes
+
     public void tick() {
         if (paused) return;
 
@@ -131,9 +136,19 @@ public class BotBrain {
             bot.deathTime = 0;
             respawnCooldown--;
             if (respawnCooldown <= 0) {
+                deaths++;
+                LOG.info(name + " died (death #" + deaths + "). Respawning...");
                 respawnBot();
             }
             return;
+        }
+
+        // Periodic stats logging
+        ticksAlive++;
+        if (ticksAlive % STATS_LOG_INTERVAL == 0) {
+            LOG.info(String.format("[%s] Alive %d min | Deaths: %d | HP: %.1f | Target: %s",
+                name, ticksAlive / 1200, deaths, bot.getHealth(),
+                target != null ? target.getScoreboardName() : "none"));
         }
 
         // Ensure bot is hittable (not globally invulnerable)
@@ -402,6 +417,10 @@ public class BotBrain {
 
     public boolean isPaused() {
         return paused;
+    }
+
+    public int getDeaths() {
+        return deaths;
     }
 
     public void setAllies(Set<UUID> allies) {
