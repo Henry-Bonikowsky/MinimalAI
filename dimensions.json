@@ -1,0 +1,201 @@
+{
+  "_comment": "Single source of truth for MinimalAI dimensions. Run scripts/gen_config.py to regenerate Java and Python constants.",
+
+  "action_space": {
+    "num_actions": 35,
+    "num_sigil_slots": 12,
+    "num_target_slots": 5,
+    "look_snap_factor": 1.0,
+    "groups": {
+      "movement": {
+        "start": 0,
+        "actions": [
+          {"name": "FORWARD",      "index": 0},
+          {"name": "BACKWARD",     "index": 1},
+          {"name": "STRAFE_LEFT",  "index": 2},
+          {"name": "STRAFE_RIGHT", "index": 3},
+          {"name": "JUMP",         "index": 4},
+          {"name": "SNEAK",        "index": 5},
+          {"name": "SPRINT",       "index": 6}
+        ]
+      },
+      "combat": {
+        "start": 7,
+        "actions": [
+          {"name": "ATTACK",       "index": 7,  "comment": "auto-derived from ENGAGE"},
+          {"name": "BLOCK",        "index": 8,  "comment": "1.8 sword block"},
+          {"name": "EAT_GAP",      "index": 9,  "comment": "golden apple"},
+          {"name": "THROW_POT",    "index": 10, "comment": "splash health pot"},
+          {"name": "THROW_PEARL",  "index": 11, "comment": "ender pearl"},
+          {"name": "SPRINT_RESET", "index": 12, "comment": "toggle sprint for KB reset"},
+          {"name": "SWAP_WEAPON",  "index": 13, "comment": "always masked"}
+        ]
+      },
+      "sigils": {
+        "start": 14,
+        "count": 12,
+        "comment": "sigil abilities (14-25, 12 slots)"
+      },
+      "camera": {
+        "start": 26,
+        "actions": [
+          {"name": "ENGAGE",         "index": 26, "comment": "face target + auto-attack when in reach"},
+          {"name": "FACE_AWAY",      "index": 27, "comment": "look opposite of target (kiting)"},
+          {"name": "LOOK_DOWN_SELF", "index": 28, "comment": "look at feet (self-pot)"},
+          {"name": "FACE_MOVEMENT",  "index": 29, "comment": "face movement direction"}
+        ],
+        "aliases": {
+          "FACE_TARGET": 26
+        }
+      },
+      "target_selection": {
+        "start": 30,
+        "count": 5,
+        "comment": "target selection (30-34, up to 5 nearby entities)"
+      }
+    }
+  },
+
+  "observation_space": {
+    "max_entities": 8,
+    "self_state_dim": 38,
+    "entity_feature_dim": 24,
+    "combat_ctx_dim": 26,
+    "num_sigil_slots": 12,
+    "sigil_dims_per_slot": 4,
+    "env_state_dim": 8,
+    "obs_dim": 320,
+
+    "self_state_slots": {
+      "health":          0,
+      "max_health":      1,
+      "absorption":      2,
+      "armor":           3,
+      "armor_toughness": 4,
+      "vel_x":           5,
+      "vel_y":           6,
+      "vel_z":           7,
+      "yaw":             8,
+      "pitch":           9,
+      "on_ground":      10,
+      "is_sprinting":   11,
+      "is_sneaking":    12,
+      "is_blocking":    13,
+      "is_using_item":  14,
+      "fall_distance":  15,
+      "weapon_sword":   16,
+      "weapon_axe":     17,
+      "weapon_other":   18,
+      "attack_damage":  19,
+      "golden_apples":  20,
+      "splash_pots":    21,
+      "ender_pearls":   22,
+      "totems":         23,
+      "effect_speed":          24,
+      "effect_strength":       25,
+      "effect_resistance":     26,
+      "effect_fire_resistance":27,
+      "effect_regeneration":   28,
+      "effect_poison":         29,
+      "effect_wither":         30,
+      "effect_slowness":       31,
+      "effect_weakness":       32,
+      "hurt_time":             33,
+      "sigil_damage_amp":      34,
+      "sigil_damage_reduction":35,
+      "sigil_kb_charges":      36,
+      "sigil_invuln_hits":     37
+    },
+
+    "entity_feature_slots": {
+      "alliance":       0,
+      "dx":             1,
+      "dy":             2,
+      "dz":             3,
+      "dist":           4,
+      "health":         5,
+      "max_health":     6,
+      "armor":          7,
+      "vel_x":          8,
+      "vel_y":          9,
+      "vel_z":         10,
+      "yaw":           11,
+      "on_ground":     12,
+      "is_sprinting":  13,
+      "is_blocking":   14,
+      "is_using_item": 15,
+      "weapon_sword":  16,
+      "weapon_axe":    17,
+      "weapon_other":  18,
+      "attack_dmg":    19,
+      "hurt_time":     20,
+      "is_current_target": 21,
+      "pharaoh_mark":  22,
+      "dist_to_target":23
+    }
+  },
+
+  "used_bits": [0, 2, 3, 4, 9, 10, 11, 14, 15, 16, 17, 26],
+  "used_bits_comment": "FWD, LEFT, RIGHT, JUMP, EAT, POT, PEARL, SIGIL0-3, ENGAGE",
+
+  "consumables": {
+    "golden_apple": {
+      "eat_ticks": 36,
+      "cooldown_ticks": 180,
+      "absorption": 4.0,
+      "regen_ticks": 100,
+      "regen_rate": 25,
+      "start_count": 64
+    },
+    "splash_pot": {
+      "heal_amount": 8.0,
+      "splash_radius": 4.0,
+      "throw_lockout": 3,
+      "start_count": 31
+    },
+    "ender_pearl": {
+      "cooldown_ticks": 200,
+      "self_damage": 5.0,
+      "start_count": 16
+    }
+  },
+
+  "combat": {
+    "melee_angle_deg": 60,
+    "default_attack_reach": 3.0,
+    "i_frame_ticks": 10
+  },
+
+  "network": {
+    "entity_embed_dim": 64,
+    "attention_heads": 2,
+    "attention_layers": 2,
+    "hidden_dim": 256,
+    "gru_hidden_dim": 128
+  },
+
+  "sigils": {
+    "active_ability_slots": [1, 2, 3, 5],
+    "brace": {
+      "charge_req": 30,
+      "dr": 0.80,
+      "duration": 200,
+      "cooldown": 600
+    },
+    "cleo": {
+      "dmg_amp": 1.20,
+      "duration": 100,
+      "cooldown": 180
+    },
+    "sand": {
+      "dmg_amp": 1.30,
+      "duration": 120,
+      "cooldown": 140
+    },
+    "grace": {
+      "dr": 0.30,
+      "duration": 200,
+      "cooldown": 180
+    }
+  }
+}

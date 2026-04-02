@@ -36,7 +36,6 @@ public class MinimalAIPlugin extends JavaPlugin {
     private BukkitRunnable tickTask;
     private BotCommand botCmd;
     private MaiCommand maiCmd;
-
     @Override
     public void onEnable() {
         saveDefaultConfig();
@@ -44,9 +43,8 @@ public class MinimalAIPlugin extends JavaPlugin {
         // Initialize ArcaneSigils bridge
         sigilsBridge = new ArcaneSigilsBridge(getLogger());
 
-        // Initialize bot system
+        // Initialize bot system (uses Imperium JAR's native fake player API)
         botManager = new FakePlayerManager(getLogger(), this);
-        getServer().getPluginManager().registerEvents(botManager, this);
 
         // Initialize model manager
         Path modelsDir = getDataFolder().toPath().resolve(
@@ -106,8 +104,14 @@ public class MinimalAIPlugin extends JavaPlugin {
         KitManager kitManager = new KitManager(kitsDir, getLogger());
 
         // BotCommand is an internal service (brain lifecycle + tick)
+        List<String> defaultSigils = getConfig().getStringList("bot.default-sigils");
+        double defaultAttackReach = getConfig().getDouble("bot.default-attack-reach", 3.0);
         botCmd = new BotCommand(botManager, modelManager, obsBuilder, actionExecutor,
-                sigilsApi, experienceBuffer, rewardComputer, episodeManager, kitManager);
+                sigilsApi, experienceBuffer, rewardComputer, episodeManager, kitManager,
+                defaultSigils, defaultAttackReach);
+        botCmd.setDefaultMode(getConfig().getString("bot.default-mode", "hybrid"));
+        botCmd.setDefaultDifficulty(getConfig().getInt("bot.default-difficulty", 3));
+        botCmd.setSigilModelName(getConfig().getString("bot.sigil-model", null));
 
         // MaiCommand handles all /mai subcommands + event listening
         maiCmd = new MaiCommand(botCmd, modelManager, kitManager,

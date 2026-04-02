@@ -152,6 +152,32 @@ public class ModelManager implements AutoCloseable {
     }
 
     /**
+     * Run inference for the sigil network (simpler 2-input signature).
+     *
+     * @param predictor sigil model predictor
+     * @param manager   NDManager for tensor allocation
+     * @param obs       (20,) sigil observation
+     * @param mask      (7,) action mask (1=ready, 0=cooldown)
+     * @return float[7] probabilities for each sigil ability
+     */
+    public float[] inferSigil(Predictor<NDList, NDList> predictor,
+                               NDManager manager,
+                               float[] obs,
+                               float[] mask) throws Exception {
+        try (NDManager tickManager = manager.newSubManager()) {
+            NDList input = new NDList(
+                    TensorUtil.toNDArray(tickManager, obs, 1, obs.length),
+                    TensorUtil.toNDArray(tickManager, mask, 1, mask.length)
+            );
+
+            NDList output = predictor.predict(input);
+
+            // Output: [probs(7), value(1)]
+            return TensorUtil.toFloatArray(output.get(0));
+        }
+    }
+
+    /**
      * Hot-reload a model: close the old version and load the new one.
      */
     public void hotReload(String name) {

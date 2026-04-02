@@ -12,7 +12,6 @@ commands:
     usage: /mai <model|train|bot|kit|status|stop|help>
     aliases: [minimalai, minai]
     permission: minimalai.use
-
 permissions:
   minimalai.use:
     default: op

@@ -9,6 +9,34 @@ model:
 bot:
   tick-rate: 1
   max-bots: 8
+  # Brain mode: "neural" (full model), "rule" (hand-coded combat), "hybrid" (rule combat + neural sigils)
+  default-mode: "hybrid"
+  # Difficulty tier 1-5 for rule/hybrid mode (1=recruit, 3=veteran, 5=mythic)
+  default-difficulty: 3
+  # Sigil model name for hybrid mode (TorchScript .pt in models dir, without extension)
+  sigil-model: "sigil_model"
+  # Engage auto-attack reach (2.0-3.0 blocks). Lower = easier bot. Default 3.0 = max range.
+  # Only used in NEURAL mode; rule/hybrid uses difficulty-derived reach.
+  default-attack-reach: 3.0
+  # Sigils to register on bots (ArcaneSigils integration).
+  # One exclusive per gear piece (6 max), plus unlimited regulars.
+  default-sigils:
+    # Exclusives (one per gear slot)
+    - ancient_crown        # helmet: immunity to negative effects
+    - kings_brace          # chestplate: scaling DR + burst resistance
+    - cleopatra            # leggings: strip buffs + dmg amp
+    - quick_sand           # boots: slow aura + pull on hit
+    - divine_intervention  # sword: invuln hits while blocking
+    - niles_grace          # axe: regen + resistance
+    # Regulars (stack freely, all passive/on-hit)
+    - iron_forged          # fire resistance
+    - lifeforce            # passive HP regen every 5s
+    - extra_padding        # +max health
+    - iron_fist            # strength II
+    - rocket_boots         # speed I-II
+    - well_fed             # on-hit food restore
+    - spring_shoes         # jump boost
+    - meal_planning        # auto-feed when hungry
 
 # Arena center for env_state observations
 arena:

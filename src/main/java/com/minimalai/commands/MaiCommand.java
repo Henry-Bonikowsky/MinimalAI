@@ -45,7 +45,7 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
     private static final int SELFPLAY_EPISODE_TICKS = 6000; // 5 minutes
     private static final List<String> TOP_COMMANDS = Arrays.asList("model", "train", "bot", "kit", "record", "status", "stop", "help");
     private static final List<String> MODEL_SUBS = Arrays.asList("create", "delete", "list", "load", "duel", "default");
-    private static final List<String> BOT_SUBS = Arrays.asList("spawn", "despawn", "list");
+    private static final List<String> BOT_SUBS = Arrays.asList("spawn", "despawn", "list", "duel");
     private static final List<String> KIT_SUBS = Arrays.asList("save", "delete", "list", "default");
     private static final List<String> TEAM_SIZES = Arrays.asList("2v2", "3v3", "5v5");
 
@@ -416,8 +416,10 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
         if (args.length == 0) { sendBotHelp(sender); return; }
         switch (args[0].toLowerCase()) {
             case "spawn"   -> handleBotSpawn(sender, args);
+            case "bare"    -> handleBotBare(sender, args);
             case "despawn" -> handleBotDespawn(sender, args);
             case "list"    -> handleBotList(sender);
+            case "duel"    -> handleBotDuel(sender, args);
             default        -> sendBotHelp(sender);
         }
     }
@@ -442,8 +444,12 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
             String cName = args[1];
             String cModel = args.length >= 7 ? args[6] : defaultModel;
             String cKit = args.length >= 8 ? args[7] : defaultKit;
+            int cDiff = -1;
+            if (args.length >= 9) {
+                try { cDiff = Integer.parseInt(args[8]); } catch (NumberFormatException ignored) {}
+            }
             if (cKit != null && !kitManager.listKits().contains(cKit)) cKit = null;
-            BotContext ctx = botCmd.spawnBot(w, loc, cName, cModel, cKit);
+            BotContext ctx = botCmd.spawnBot(w, loc, cName, cModel, cKit, cDiff);
             if (ctx == null) { sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot."); return; }
             sender.sendMessage(PREFIX + ChatColor.GREEN + "Spawned '" + ctx.name() + "'.");
             return;
@@ -464,6 +470,97 @@ public class MaiCommand implements CommandExecutor, TabCompleter, Listener {
             return;
         }
         sender.sendMessage(PREFIX + ChatColor.GREEN + "Spawned '" + ctx.name() + "'.");
+    }
+
+    /**
+     * Spawn two bots and make them fight each other.
+     * Usage: /mai bot duel <model1> <model2> [kit]
+     */
+    private void handleBotDuel(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /mai bot duel <model1> <model2> [kit]");
+            return;
+        }
+        String model1 = args[1];
+        String model2 = args[2];
+        String kitName = args.length >= 4 ? args[3] : defaultKit;
+        if (kitName != null && !kitManager.listKits().contains(kitName)) {
+            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Kit '" + kitName + "' not found, using default.");
+            kitName = defaultKit;
+        }
+
+        Location loc;
+        if (sender instanceof Player player) {
+            loc = player.getLocation();
+        } else {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Only players can start bot duels (need a location).");
+            return;
+        }
+
+        // Spawn bot A 3 blocks to the left, bot B 3 blocks to the right
+        double yaw = Math.toRadians(loc.getYaw());
+        double perpX = Math.cos(yaw);
+        double perpZ = Math.sin(yaw);
+        Location locA = loc.clone().add(perpX * 3, 0, perpZ * 3);
+        Location locB = loc.clone().add(-perpX * 3, 0, -perpZ * 3);
+
+        String nameA = "Duel_" + model1;
+        String nameB = "Duel_" + model2;
+
+        BotContext ctxA = botCmd.spawnBot(loc.getWorld(), locA, nameA, model1, kitName);
+        if (ctxA == null) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot A (model '" + model1 + "'). Is it loaded?");
+            return;
+        }
+        BotContext ctxB = botCmd.spawnBot(loc.getWorld(), locB, nameB, model2, kitName);
+        if (ctxB == null) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot B (model '" + model2 + "'). Is it loaded?");
+            botCmd.removeBrain(nameA);
+            botCmd.getBotManager().despawn(nameA);
+            return;
+        }
+
+        // Point them at each other
+        BotBrain brainA = botCmd.getBrains().get(nameA);
+        BotBrain brainB = botCmd.getBrains().get(nameB);
+        if (brainA != null) brainA.setTarget(ctxB.serverPlayer());
+        if (brainB != null) brainB.setTarget(ctxA.serverPlayer());
+
+        sender.sendMessage(PREFIX + ChatColor.GREEN + "Bot duel started: " + nameA + " vs " + nameB);
+    }
+
+    /**
+     * Spawn a bare bot with NO brain, NO kit, NO sigils - for debugging entity behavior.
+     * Usage: /mai bot bare [name]
+     */
+    private void handleBotBare(CommandSender sender, String[] args) {
+        Location loc;
+        String name = args.length >= 2 ? args[1] : null;
+
+        if (sender instanceof Player player) {
+            loc = player.getLocation();
+        } else {
+            // Console/RCON: bare <name> <world> <x> <y> <z>
+            if (args.length < 6) {
+                sender.sendMessage(PREFIX + ChatColor.RED + "Console usage: /mai bot bare <name> <world> <x> <y> <z>");
+                return;
+            }
+            World w = Bukkit.getWorld(args[2]);
+            if (w == null) { sender.sendMessage(PREFIX + ChatColor.RED + "World '" + args[2] + "' not found."); return; }
+            try {
+                loc = new Location(w, Double.parseDouble(args[3]), Double.parseDouble(args[4]), Double.parseDouble(args[5]));
+            } catch (NumberFormatException e) {
+                sender.sendMessage(PREFIX + ChatColor.RED + "Invalid coordinates."); return;
+            }
+            name = args[1];
+        }
+
+        BotContext ctx = botCmd.spawnBare(loc.getWorld(), loc, name);
+        if (ctx == null) {
+            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bare bot.");
+            return;
+        }
+        sender.sendMessage(PREFIX + ChatColor.GREEN + "Spawned BARE bot '" + ctx.name() + "' (no brain/kit/sigils).");
     }
 
     private void handleBotDespawn(CommandSender sender, String[] args) {

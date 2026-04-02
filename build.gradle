@@ -13,6 +13,7 @@ java {
 
 repositories {
     mavenCentral()
+    maven { url = "https://repo.luckperms.net/repository/maven-public/" }
 }
 
 dependencies {
@@ -24,9 +25,18 @@ dependencies {
     implementation "ai.djl.pytorch:pytorch-native-cpu:2.5.1"
 
     compileOnly "io.papermc.paper:paper-api:1.21.10-R0.1-SNAPSHOT"
+
+    // LuckPerms API (provided at runtime by the LP plugin)
+    compileOnly "net.luckperms:api:5.4"
+}
+
+task generateConstants(type: Exec) {
+    commandLine 'python', 'scripts/gen_config.py'
+    workingDir projectDir
 }
 
 tasks.withType(JavaCompile).configureEach {
+    dependsOn generateConstants
     options.encoding = 'UTF-8'
 }
 

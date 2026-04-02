@@ -475,11 +475,24 @@ public class ActionExecutor {
     //  Sigil abilities (actions 14-25)
     // ------------------------------------------------------------------
 
+    // Active ability slots: neural net output [0-3] → ArcaneSigils bind slot
+    // [0]=brace(1), [1]=cleopatra(2), [2]=quicksand(3), [3]=grace(5)
+    // Matches BotBrain.ACTIVE_ABILITY_SLOTS
+    private static final int[] ACTIVE_ABILITY_SLOTS = {1, 2, 3, 5};
+
     private void applySigils(ServerPlayer bot, int[] actions) {
-        // Sigils are now handled automatically by ArcaneSigils via BotSigilRegistry.
-        // Signal-based sigils (attack/defense/passive) fire through Bukkit events.
-        // Ability sigils auto-fire on ATTACK signal when off cooldown.
-        // No action-space activation needed.
+        if (sigilsApi == null) return;
+        Player p = getBukkitPlayer(bot);
+        if (p == null) return;
+
+        for (int i = 0; i < ACTIVE_ABILITY_SLOTS.length; i++) {
+            if (actions[ACT_SIGIL_0 + i] == 1) {
+                boolean fired = sigilsApi.activateAbility(p, ACTIVE_ABILITY_SLOTS[i]);
+                if (fired) {
+                    LOGGER.fine("[Sigil] " + bot.getScoreboardName() + " activated slot " + ACTIVE_ABILITY_SLOTS[i]);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -607,8 +620,17 @@ public class ActionExecutor {
         // Swap weapon: always masked
         mask[ACT_SWAP_WEAPON] = 0f;
 
-        // Sigil slots: always masked — sigils are handled automatically by ArcaneSigils
-        for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
+        // Sigil slots: unmask active abilities based on cooldown readiness
+        if (sigilCooldowns != null) {
+            Player bukkitPlayer = getBukkitPlayer(bot);
+            if (bukkitPlayer != null) {
+                for (int i = 0; i < ACTIVE_ABILITY_SLOTS.length; i++) {
+                    mask[ACT_SIGIL_0 + i] = sigilCooldowns.isReady(bukkitPlayer, ACTIVE_ABILITY_SLOTS[i]) ? 1f : 0f;
+                }
+            }
+        }
+        // Remaining sigil slots (beyond our 4 actives) stay masked
+        for (int i = ACTIVE_ABILITY_SLOTS.length; i < NUM_SIGIL_SLOTS; i++) {
             mask[ACT_SIGIL_0 + i] = 0f;
         }
 

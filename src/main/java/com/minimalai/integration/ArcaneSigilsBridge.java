@@ -105,10 +105,29 @@ public class ArcaneSigilsBridge implements ArcaneSigilsAPI {
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public List<SigilInfo> getEquippedSigils(Player player) {
         if (!isAvailable()) return Collections.emptyList();
-        // TODO: Map native SigilInfo records to our SigilInfo records
-        return Collections.emptyList();
+        try {
+            List<?> nativeList = (List<?>) mGetEquippedSigils.invoke(nativeApi, player);
+            if (nativeList == null || nativeList.isEmpty()) return Collections.emptyList();
+
+            List<SigilInfo> result = new java.util.ArrayList<>(nativeList.size());
+            for (Object nativeSigil : nativeList) {
+                // Native SigilInfo is a record with: id, name, tier, slot, activationType
+                Class<?> cls = nativeSigil.getClass();
+                String id = (String) cls.getMethod("id").invoke(nativeSigil);
+                String name = (String) cls.getMethod("name").invoke(nativeSigil);
+                int tier = (int) cls.getMethod("tier").invoke(nativeSigil);
+                String slot = (String) cls.getMethod("slot").invoke(nativeSigil);
+                String activationType = (String) cls.getMethod("activationType").invoke(nativeSigil);
+                result.add(new SigilInfo(id, name, tier, slot, activationType));
+            }
+            return result;
+        } catch (Exception e) {
+            logger.warning("Failed to get equipped sigils: " + e.getMessage());
+            return Collections.emptyList();
+        }
     }
 
     @Override

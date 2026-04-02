@@ -88,59 +88,152 @@ public class KitManager {
 
         YamlConfiguration config = YamlConfiguration.loadConfiguration(file);
         int itemsLoaded = 0;
+        int itemsFailed = 0;
 
         // Load main inventory slots
         if (config.isConfigurationSection("inventory")) {
             for (String key : config.getConfigurationSection("inventory").getKeys(false)) {
                 int slot = Integer.parseInt(key);
-                ItemStack item = config.getItemStack("inventory." + key);
-                if (item != null) {
-                    inv.setItem(slot, item);
-                    itemsLoaded++;
+                try {
+                    ItemStack item = config.getItemStack("inventory." + key);
+                    if (item != null) {
+                        inv.setItem(slot, item);
+                        itemsLoaded++;
+                    } else {
+                        itemsFailed++;
+                        String id = config.getString("inventory." + key + ".id", "unknown");
+                        logger.warning("Kit '" + name + "' slot " + slot + " (" + id + ") deserialized to null");
+                    }
+                } catch (Exception e) {
+                    itemsFailed++;
+                    logger.warning("Kit '" + name + "' slot " + slot + " exception: " + e.getMessage());
                 }
             }
         }
 
         // Load armor
         if (config.isConfigurationSection("armor")) {
-            ItemStack boots = config.getItemStack("armor.boots");
-            ItemStack leggings = config.getItemStack("armor.leggings");
-            ItemStack chestplate = config.getItemStack("armor.chestplate");
-            ItemStack helmet = config.getItemStack("armor.helmet");
-            if (boots != null) { inv.setBoots(boots); itemsLoaded++; }
-            if (leggings != null) { inv.setLeggings(leggings); itemsLoaded++; }
-            if (chestplate != null) { inv.setChestplate(chestplate); itemsLoaded++; }
-            if (helmet != null) { inv.setHelmet(helmet); itemsLoaded++; }
+            for (String slot : List.of("boots", "leggings", "chestplate", "helmet")) {
+                try {
+                    ItemStack item = config.getItemStack("armor." + slot);
+                    if (item != null) {
+                        switch (slot) {
+                            case "boots" -> inv.setBoots(item);
+                            case "leggings" -> inv.setLeggings(item);
+                            case "chestplate" -> inv.setChestplate(item);
+                            case "helmet" -> inv.setHelmet(item);
+                        }
+                        itemsLoaded++;
+                    } else {
+                        itemsFailed++;
+                        String id = config.getString("armor." + slot + ".id", "unknown");
+                        logger.warning("Kit '" + name + "' armor." + slot + " (" + id + ") deserialized to null");
+                    }
+                } catch (Exception e) {
+                    itemsFailed++;
+                    logger.warning("Kit '" + name + "' armor." + slot + " exception: " + e.getMessage());
+                }
+            }
         }
 
         // Load offhand
-        ItemStack offhand = config.getItemStack("offhand");
-        if (offhand != null) {
-            inv.setItemInOffHand(offhand);
-            itemsLoaded++;
+        try {
+            ItemStack offhand = config.getItemStack("offhand");
+            if (offhand != null) {
+                inv.setItemInOffHand(offhand);
+                itemsLoaded++;
+            }
+        } catch (Exception e) {
+            logger.warning("Kit '" + name + "' offhand exception: " + e.getMessage());
         }
 
-        // Fallback: if YAML deserialization failed (0 items loaded),
-        // try loading items using the simple format (id + count only)
-        if (itemsLoaded == 0) {
-            logger.warning("Kit '" + name + "' Bukkit deserialization returned 0 items. Sections: "
-                + "inventory=" + config.isConfigurationSection("inventory")
-                + " armor=" + config.isConfigurationSection("armor")
-                + " File: " + file.getAbsolutePath() + " exists=" + file.exists());
-            itemsLoaded = applyKitSimple(config, inv);
-            if (itemsLoaded == 0) {
-                logger.warning("Simple format also returned 0 items. Trying direct NMS.");
-                applyPlainKitFallback(bot);
-                itemsLoaded = 6;
-            }
+        // Ensure critical slots are filled even if YAML deserialization failed for them
+        ensureCriticalSlots(inv, config);
+
+        // Fallback: if nothing loaded at all, use plain kit
+        if (itemsLoaded == 0 && itemsFailed > 0) {
+            logger.warning("Kit '" + name + "' ALL items failed to deserialize (" + itemsFailed + " failures). Using plain fallback.");
+            applyPlainKitFallback(bot);
         }
 
         // Set selected slot
         int selectedSlot = config.getInt("selected-slot", 0);
         inv.setHeldItemSlot(selectedSlot);
 
-        logger.info("Applied kit '" + name + "' (" + itemsLoaded + " items) to bot " + bot.getScoreboardName());
+        logger.info("Applied kit '" + name + "' (" + itemsLoaded + " loaded, " + itemsFailed + " failed) to bot " + bot.getScoreboardName());
         return true;
+    }
+
+    /**
+     * Ensure critical inventory slots are populated even if YAML deserialization
+     * failed for complex items. Fills sword, golden apples, and armor with
+     * enchanted fallbacks if the slots are empty.
+     */
+    private void ensureCriticalSlots(PlayerInventory inv, YamlConfiguration config) {
+        // Slot 0: must have a sword
+        if (inv.getItem(0) == null || inv.getItem(0).getType().isAir()) {
+            ItemStack sword = new ItemStack(Material.DIAMOND_SWORD, 1);
+            // Add Sharpness VI if the kit expected it
+            String enchStr = config.getString("inventory.0.components.minecraft:enchantments", "");
+            if (enchStr.contains("sharpness")) {
+                sword.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.SHARPNESS, 6);
+            }
+            if (enchStr.contains("fire_aspect")) {
+                sword.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.FIRE_ASPECT, 2);
+            }
+            inv.setItem(0, sword);
+            logger.info("  Filled slot 0 with enchanted diamond sword (fallback)");
+        }
+
+        // Slot 2: golden apples if missing (slot 2 in test kit has 64 gapples)
+        if (inv.getItem(2) == null || inv.getItem(2).getType().isAir()) {
+            if (config.isConfigurationSection("inventory.2")) {
+                inv.setItem(2, new ItemStack(Material.GOLDEN_APPLE, 64));
+                logger.info("  Filled slot 2 with 64 golden apples (fallback)");
+            }
+        }
+
+        // Armor: fill with enchanted diamond if leather custom armor failed
+        if (inv.getHelmet() == null || inv.getHelmet().getType().isAir()) {
+            if (config.isConfigurationSection("armor.helmet")) {
+                ItemStack helmet = new ItemStack(Material.DIAMOND_HELMET, 1);
+                helmet.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.PROTECTION, 5);
+                inv.setHelmet(helmet);
+                logger.info("  Filled helmet with enchanted diamond (fallback)");
+            }
+        }
+        if (inv.getChestplate() == null || inv.getChestplate().getType().isAir()) {
+            if (config.isConfigurationSection("armor.chestplate")) {
+                ItemStack cp = new ItemStack(Material.DIAMOND_CHESTPLATE, 1);
+                cp.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.PROTECTION, 5);
+                inv.setChestplate(cp);
+                logger.info("  Filled chestplate with enchanted diamond (fallback)");
+            }
+        }
+        if (inv.getLeggings() == null || inv.getLeggings().getType().isAir()) {
+            if (config.isConfigurationSection("armor.leggings")) {
+                ItemStack legs = new ItemStack(Material.DIAMOND_LEGGINGS, 1);
+                legs.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.PROTECTION, 5);
+                inv.setLeggings(legs);
+                logger.info("  Filled leggings with enchanted diamond (fallback)");
+            }
+        }
+        if (inv.getBoots() == null || inv.getBoots().getType().isAir()) {
+            if (config.isConfigurationSection("armor.boots")) {
+                ItemStack boots = new ItemStack(Material.DIAMOND_BOOTS, 1);
+                boots.addUnsafeEnchantment(org.bukkit.enchantments.Enchantment.PROTECTION, 5);
+                inv.setBoots(boots);
+                logger.info("  Filled boots with enchanted diamond (fallback)");
+            }
+        }
+
+        // Offhand: totem of undying
+        if (inv.getItemInOffHand().getType().isAir()) {
+            if (config.isConfigurationSection("offhand") || config.getString("offhand.id", "").contains("totem")) {
+                inv.setItemInOffHand(new ItemStack(Material.TOTEM_OF_UNDYING, 1));
+                logger.info("  Filled offhand with totem of undying (fallback)");
+            }
+        }
     }
 
     /**

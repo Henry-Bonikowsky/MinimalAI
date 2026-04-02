@@ -8,12 +8,15 @@ import torch
 from .vec_sim import VecPvPSim, OBS_DIM, NUM_ACTIONS
 from .models.network import CombatNetwork, GRU_HIDDEN_DIM
 from .fast_train import PolicyWrapper, rule_based_opponent
+from .rule_test import rule_charger_smart
 
 
-def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device="cpu"):
+def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device="cpu", combo_style="stap", gauntlet=False, smart_opponent=False):
     """Run evaluation episodes and return stats."""
     rng = np.random.default_rng(123)
-    sim = VecPvPSim(n_envs, episode_length=episode_length, seed=123)
+    sim = VecPvPSim(n_envs, episode_length=episode_length, seed=123, combo_style=combo_style, gauntlet=gauntlet)
+    if gauntlet:
+        sim.gauntlet_survivor = 'a'  # In evaluate, model is A, rule opponent is B
 
     network = CombatNetwork()
     policy = PolicyWrapper(network).to(device)
@@ -30,13 +33,14 @@ def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device=
 
     obs = sim.reset_all()
     completed = 0
-    wins = 0
-    losses = 0
-    draws = 0
+    kills = 0        # A killed B (b_health <= 0)
+    deaths = 0       # B killed A (a_health <= 0)
+    timeouts = 0     # Neither died
     total_rewards = []
     ep_lengths = []
     total_damage_dealt = []
     total_damage_taken = []
+    total_kill_counts = []
     current_rewards = np.zeros(n_envs)
     current_lengths = np.zeros(n_envs, dtype=np.int32)
     current_dmg_dealt = np.zeros(n_envs)
@@ -49,15 +53,15 @@ def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device=
         action_np = action.cpu().numpy().astype(np.int8)
 
         # Rule-based opponent
-        b_actions = rule_based_opponent(sim, rng)
+        b_actions = rule_charger_smart(sim) if smart_opponent else rule_based_opponent(sim, rng)
 
         next_obs, rewards, dones, infos = sim.step(action_np, b_actions)
 
         current_rewards += rewards
         current_lengths += 1
-
-        # Track damage (note: health resets on episode end so only track within episodes)
-        # We approximate by looking at reward signals instead
+        # Track per-tick damage from sim
+        current_dmg_dealt += infos.get("a_dmg_dealt", np.zeros(n_envs))
+        current_dmg_taken += infos.get("b_dmg_dealt", np.zeros(n_envs))
 
         for i in range(n_envs):
             if dones[i] and completed < n_episodes:
@@ -65,14 +69,24 @@ def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device=
                 ep_lengths.append(int(current_lengths[i]))
                 total_damage_dealt.append(float(current_dmg_dealt[i]))
                 total_damage_taken.append(float(current_dmg_taken[i]))
+                total_kill_counts.append(int(infos.get("kill_count", np.zeros(n_envs))[i]))
 
-                # Determine win/loss
-                if current_rewards[i] > 5:
-                    wins += 1
-                elif current_rewards[i] < -5:
-                    losses += 1
+                # Determine win/loss by actual health (infos captured before reset)
+                a_hp = infos["a_health"][i]
+                b_hp = infos["b_health"][i]
+                if gauntlet:
+                    # In gauntlet, episode ends on A (model) death or timeout
+                    if a_hp <= 0:
+                        deaths += 1
+                    else:
+                        timeouts += 1  # survived to timeout
                 else:
-                    draws += 1
+                    if b_hp <= 0:
+                        kills += 1
+                    elif a_hp <= 0:
+                        deaths += 1
+                    else:
+                        timeouts += 1
 
                 current_rewards[i] = 0
                 current_lengths[i] = 0
@@ -82,14 +96,14 @@ def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device=
 
         obs = next_obs
 
-    return {
+    results = {
         "model": model_path,
         "steps_trained": steps_trained,
         "episodes_trained": episodes_trained,
         "n_eval_episodes": completed,
-        "win_rate": wins / completed,
-        "loss_rate": losses / completed,
-        "draw_rate": draws / completed,
+        "kill_rate": kills / completed,
+        "death_rate": deaths / completed,
+        "timeout_rate": timeouts / completed,
         "mean_reward": np.mean(total_rewards),
         "std_reward": np.std(total_rewards),
         "median_reward": np.median(total_rewards),
@@ -97,11 +111,15 @@ def evaluate(model_path, n_episodes=500, n_envs=64, episode_length=1800, device=
         "mean_dmg_dealt": np.mean(total_damage_dealt),
         "mean_dmg_taken": np.mean(total_damage_taken),
     }
+    if gauntlet:
+        results["mean_kills"] = np.mean(total_kill_counts)
+        results["max_kills"] = max(total_kill_counts) if total_kill_counts else 0
+    return results
 
 
-def evaluate_selfplay(model_path, n_episodes=500, n_envs=64, episode_length=1800, device="cpu"):
+def evaluate_selfplay(model_path, n_episodes=500, n_envs=64, episode_length=1800, device="cpu", combo_style="stap"):
     """Evaluate model against itself (check for degenerate strategies)."""
-    sim = VecPvPSim(n_envs, episode_length=episode_length, seed=456)
+    sim = VecPvPSim(n_envs, episode_length=episode_length, seed=456, combo_style=combo_style)
 
     network = CombatNetwork()
     policy = PolicyWrapper(network).to(device)
@@ -141,9 +159,10 @@ def evaluate_selfplay(model_path, n_episodes=500, n_envs=64, episode_length=1800
         for i in range(n_envs):
             if dones[i] and completed < n_episodes:
                 ep_lengths.append(int(current_lengths[i]))
-                if sim.b_health[i] <= 0:
+                # Use infos health (captured BEFORE auto-reset)
+                if infos["b_health"][i] <= 0:
                     a_kills += 1
-                elif sim.a_health[i] <= 0:
+                elif infos["a_health"][i] <= 0:
                     b_kills += 1
                 else:
                     timeouts += 1
@@ -167,6 +186,11 @@ def main():
     parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--n-envs", type=int, default=64)
     parser.add_argument("--selfplay-test", action="store_true")
+    parser.add_argument("--combo-style", choices=["stap", "wtap", "none"], default="stap")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--gauntlet", action="store_true", default=False)
+    parser.add_argument("--smart-opponent", action="store_true", default=False,
+                        help="Evaluate against smart charger that heals")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -179,22 +203,23 @@ def main():
         print(f"{'-' * 60}")
 
         t0 = time.time()
-        results = evaluate(path, n_episodes=args.episodes, n_envs=args.n_envs)
+        results = evaluate(path, n_episodes=args.episodes, n_envs=args.n_envs, device=args.device, combo_style=args.combo_style, gauntlet=args.gauntlet, smart_opponent=args.smart_opponent)
         elapsed = time.time() - t0
 
         print(f"  Trained:     {results['steps_trained']} steps / {results['episodes_trained']} episodes")
         print(f"  vs Rule-Based ({results['n_eval_episodes']} episodes, {elapsed:.1f}s):")
-        print(f"    Win rate:    {results['win_rate']:.1%}")
-        print(f"    Loss rate:   {results['loss_rate']:.1%}")
-        print(f"    Draw rate:   {results['draw_rate']:.1%}")
+        print(f"    Kills:       {results['kill_rate']:.1%}  (model killed opponent)")
+        print(f"    Deaths:      {results['death_rate']:.1%}  (opponent killed model)")
+        print(f"    Timeouts:    {results['timeout_rate']:.1%}")
         print(f"    Mean reward: {results['mean_reward']:.3f} (±{results['std_reward']:.3f})")
-        print(f"    Median reward: {results['median_reward']:.3f}")
         print(f"    Mean length: {results['mean_length']:.0f} ticks")
-        print(f"    Avg dmg dealt: {results['mean_dmg_dealt']:.1f}")
-        print(f"    Avg dmg taken: {results['mean_dmg_taken']:.1f}")
+        print(f"    Avg dmg dealt: {results['mean_dmg_dealt']:.1f} HP")
+        print(f"    Avg dmg taken: {results['mean_dmg_taken']:.1f} HP")
+        if 'mean_kills' in results:
+            print(f"    Gauntlet kills: {results['mean_kills']:.1f} avg, {results['max_kills']} max")
 
         if args.selfplay_test:
-            sp = evaluate_selfplay(path, n_episodes=args.episodes, n_envs=args.n_envs)
+            sp = evaluate_selfplay(path, n_episodes=args.episodes, n_envs=args.n_envs, device=args.device, combo_style=args.combo_style)
             print(f"  Self-play ({sp['n_episodes']} episodes):")
             print(f"    A kills: {sp['a_kill_rate']:.1%}  B kills: {sp['b_kill_rate']:.1%}  Timeouts: {sp['timeout_rate']:.1%}")
             print(f"    Mean length: {sp['mean_length']:.0f} ticks")

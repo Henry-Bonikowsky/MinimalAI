@@ -2,6 +2,7 @@ package com.minimalai.commands;
 
 import com.minimalai.ai.*;
 import com.minimalai.bot.BotBrain;
+import com.minimalai.bot.BotBrain.BrainMode;
 import com.minimalai.bot.FakePlayerManager;
 import com.minimalai.bot.FakePlayerManager.BotContext;
 import com.minimalai.bot.KitManager;
@@ -36,6 +37,12 @@ public class BotCommand {
     private final @Nullable EpisodeManager episodeManager;
     private final KitManager kitManager;
     private final List<String> defaultSigils;
+    private final double defaultAttackReach;
+
+    // Config-driven defaults
+    private BrainMode defaultMode = BrainMode.NEURAL;
+    private int defaultDifficulty = 3;
+    private @Nullable String sigilModelName = null;
 
     private final Map<String, BotBrain> brains = new ConcurrentHashMap<>();
     private @Nullable MaiCommand maiCommand;
@@ -49,7 +56,8 @@ public class BotCommand {
                       @Nullable RewardComputer rewardComputer,
                       @Nullable EpisodeManager episodeManager,
                       KitManager kitManager,
-                      List<String> defaultSigils) {
+                      List<String> defaultSigils,
+                      double defaultAttackReach) {
         this.botManager = botManager;
         this.modelManager = modelManager;
         this.obsBuilder = obsBuilder;
@@ -60,6 +68,24 @@ public class BotCommand {
         this.episodeManager = episodeManager;
         this.kitManager = kitManager;
         this.defaultSigils = defaultSigils != null ? defaultSigils : Collections.emptyList();
+        this.defaultAttackReach = defaultAttackReach;
+    }
+
+    public void setDefaultMode(String mode) {
+        try {
+            this.defaultMode = BrainMode.valueOf(mode.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            LOG.warning("Unknown bot mode '" + mode + "', defaulting to NEURAL");
+            this.defaultMode = BrainMode.NEURAL;
+        }
+    }
+
+    public void setDefaultDifficulty(int difficulty) {
+        this.defaultDifficulty = Math.max(1, Math.min(5, difficulty));
+    }
+
+    public void setSigilModelName(@Nullable String name) {
+        this.sigilModelName = name;
     }
 
     public void setMaiCommand(MaiCommand cmd) {
@@ -71,14 +97,50 @@ public class BotCommand {
     // ----------------------------------------------------------------
 
     /**
+     * Spawn a bare bot with NO brain, NO kit, NO sigils - just the fake player.
+     * Use this for debugging to test if the fake player behaves like a regular entity.
+     */
+    public @Nullable BotContext spawnBare(World world, Location location, @Nullable String name) {
+        BotContext ctx = botManager.spawn(world, location, name);
+        if (ctx == null) return null;
+        LOG.info("Spawned bare bot '" + ctx.name() + "' with no brain/kit/sigils");
+        return ctx;
+    }
+
+    /**
      * Spawn a bot with a brain. Returns the BotContext or null on failure.
      * Handles: FakePlayer creation, BotBrain setup, kit application, training auto-enable.
+     *
+     * @param modelOrMode  model name, or "rule"/"hybrid" for rule-based modes
+     * @param kitName      kit name (nullable)
+     * @param difficulty   difficulty tier 1-5 (only for rule/hybrid, -1 = use default)
      */
     public @Nullable BotContext spawnBot(World world, Location location,
                                          @Nullable String name,
-                                         @Nullable String modelName,
-                                         @Nullable String kitName) {
-        if (modelManager.listModels().isEmpty()) return null;
+                                         @Nullable String modelOrMode,
+                                         @Nullable String kitName,
+                                         int difficulty) {
+        // Determine the brain mode
+        BrainMode mode = defaultMode;
+        String modelName = null;
+        int diff = difficulty > 0 ? difficulty : defaultDifficulty;
+
+        if (modelOrMode != null) {
+            switch (modelOrMode.toLowerCase()) {
+                case "rule" -> mode = BrainMode.RULE;
+                case "hybrid" -> mode = BrainMode.HYBRID;
+                default -> {
+                    mode = BrainMode.NEURAL;
+                    modelName = modelOrMode;
+                }
+            }
+        }
+
+        // NEURAL mode requires a model
+        if (mode == BrainMode.NEURAL && modelManager.listModels().isEmpty()) {
+            LOG.warning("No models available for NEURAL mode");
+            return null;
+        }
 
         BotContext ctx = botManager.spawn(world, location, name);
         if (ctx == null) return null;
@@ -102,8 +164,7 @@ public class BotCommand {
             }
         }, 2L);
 
-        // Phase 2 (tick+10): apply kit AFTER all plugins finish join processing.
-        // ArcaneSigils gives default items on join; this overwrites them.
+        // Phase 2 (tick+10): apply kit AFTER all plugins finish join processing
         if (kitName != null) {
             org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, () -> {
                 kitManager.applyKit(ctx.serverPlayer(), kitName);
@@ -111,9 +172,36 @@ public class BotCommand {
         }
 
         try {
-            String model = modelName != null ? modelName : modelManager.listModels().get(0);
-            BotBrain brain = new BotBrain(ctx.name(), ctx.serverPlayer(), modelManager, model,
-                    obsBuilder, actionExecutor, sigilsApi);
+            BotBrain brain;
+
+            switch (mode) {
+                case RULE -> {
+                    RuleCombatEngine engine = new RuleCombatEngine(diff);
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), engine,
+                            null, null, obsBuilder, actionExecutor, sigilsApi);
+                    LOG.info("Spawning RULE bot '" + ctx.name() + "' difficulty=" + diff);
+                }
+                case HYBRID -> {
+                    RuleCombatEngine engine = new RuleCombatEngine(diff);
+                    // Try to load sigil model
+                    ModelManager sigilMgr = null;
+                    String sigilModel = this.sigilModelName;
+                    if (sigilModel != null && modelManager.listModels().contains(sigilModel)) {
+                        sigilMgr = modelManager;
+                    }
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), engine,
+                            sigilMgr, sigilModel, obsBuilder, actionExecutor, sigilsApi);
+                    LOG.info("Spawning HYBRID bot '" + ctx.name() + "' difficulty=" + diff
+                            + " sigilModel=" + (sigilModel != null ? sigilModel : "none"));
+                }
+                default -> { // NEURAL
+                    String model = modelName != null ? modelName : modelManager.listModels().get(0);
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), modelManager, model,
+                            obsBuilder, actionExecutor, sigilsApi);
+                    brain.setAttackReach(defaultAttackReach);
+                    LOG.info("Spawning NEURAL bot '" + ctx.name() + "' model=" + model);
+                }
+            }
 
             if (experienceBuffer != null && rewardComputer != null) {
                 brain.setTrainingComponents(experienceBuffer, rewardComputer);
@@ -127,7 +215,20 @@ public class BotCommand {
                 }
             }
 
-            // Anchor bot to spawn position so it stays in the arena
+            // Wire death callback
+            final String botName = ctx.name();
+            brain.setOnDeath(() -> {
+                org.bukkit.Location deathLoc = ctx.serverPlayer().getBukkitEntity().getLocation();
+                int totalDeaths = brain.getDeaths();
+                org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
+                    removeBrain(botName);
+                    botManager.despawn(botName);
+                    org.bukkit.Bukkit.getPluginManager().callEvent(
+                        new com.minimalai.bot.BotDeathEvent(botName, deathLoc, totalDeaths)
+                    );
+                });
+            });
+
             brain.setSpawnAnchor(
                 ctx.serverPlayer().getX(),
                 ctx.serverPlayer().getY(),
@@ -141,6 +242,16 @@ public class BotCommand {
         }
 
         return ctx;
+    }
+
+    /**
+     * Backward-compatible spawn (defaults to config mode, no difficulty override).
+     */
+    public @Nullable BotContext spawnBot(World world, Location location,
+                                         @Nullable String name,
+                                         @Nullable String modelOrMode,
+                                         @Nullable String kitName) {
+        return spawnBot(world, location, name, modelOrMode, kitName, -1);
     }
 
     // ----------------------------------------------------------------
