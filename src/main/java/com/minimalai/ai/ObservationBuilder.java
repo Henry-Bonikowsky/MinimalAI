@@ -16,10 +16,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
-import org.bukkit.Bukkit;
-import org.bukkit.scoreboard.Objective;
-import org.bukkit.scoreboard.Score;
-import org.bukkit.scoreboard.Scoreboard;
+import com.minimalai.integration.ArcaneSigilsAPI;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.Comparator;
 import java.util.List;
@@ -42,13 +40,14 @@ public class ObservationBuilder {
 
     // Episode settings
     private int maxEpisodeTicks = 1800;
-    private int currentTick = 0;
+    private int episodeStartTick = 0;
 
     // Per-bot combat tracking: botName -> CombatState
     private final Map<String, CombatState> combatStates = new ConcurrentHashMap<>();
 
-    // Optional ArcaneSigils bridge (server-side scoreboard reader)
+    // Optional ArcaneSigils API (direct Java API via reflection bridge)
     private final boolean sigilsAvailable;
+    private final @Nullable ArcaneSigilsAPI sigilsApi;
 
     /**
      * Per-bot mutable combat state, updated from external event callbacks.
@@ -94,9 +93,15 @@ public class ObservationBuilder {
     ) {}
 
     public ObservationBuilder(double arenaCenterX, double arenaCenterZ) {
+        this(arenaCenterX, arenaCenterZ, null);
+    }
+
+    public ObservationBuilder(double arenaCenterX, double arenaCenterZ,
+                              @Nullable ArcaneSigilsAPI sigilsApi) {
         this.arenaCenterX = arenaCenterX;
         this.arenaCenterZ = arenaCenterZ;
-        this.sigilsAvailable = checkSigilsAvailable();
+        this.sigilsApi = sigilsApi;
+        this.sigilsAvailable = sigilsApi != null && sigilsApi.isAvailable();
     }
 
     // ------------------------------------------------------------------
@@ -107,8 +112,8 @@ public class ObservationBuilder {
         CombatState s = combatStates.computeIfAbsent(botName, k -> new CombatState());
         s.damageDealtThisTick += amount;
         s.comboCounter++;
-        s.lastHitTick = currentTick;
-        s.recordHit(currentTick);
+        s.lastHitTick = getCurrentTick();
+        s.recordHit(getCurrentTick());
     }
 
     public void onDamageTaken(String botName, float amount) {
@@ -118,23 +123,26 @@ public class ObservationBuilder {
     }
 
     /**
-     * Called every server tick per bot. Resets per-tick accumulators and
-     * advances the tick counter.
+     * Called every server tick per bot. Resets per-tick accumulators.
      */
     public void onTick(String botName) {
         CombatState s = combatStates.get(botName);
         if (s != null) {
             s.tickReset();
         }
-        currentTick++;
+    }
+
+    /** Get the current tick using the server's global tick counter. */
+    private int getCurrentTick() {
+        return org.bukkit.Bukkit.getCurrentTick();
     }
 
     public void setMaxEpisodeTicks(int ticks) {
         this.maxEpisodeTicks = ticks;
     }
 
-    public void setCurrentTick(int tick) {
-        this.currentTick = tick;
+    public void setEpisodeStartTick(int tick) {
+        this.episodeStartTick = tick;
     }
 
     public void resetCombatState(String botName) {
@@ -361,7 +369,7 @@ public class ObservationBuilder {
         // [9] combo counter / 10
         ctx[9] = cs.comboCounter / 10f;
         // [10] time since last hit / 100
-        ctx[10] = Math.min((currentTick - cs.lastHitTick) / 100f, 1f);
+        ctx[10] = Math.min((getCurrentTick() - cs.lastHitTick) / 100f, 1f);
         // [11] CPS estimate / 20
         ctx[11] = cs.cpsEstimate / 20f;
         // [12] sprint state
@@ -400,30 +408,26 @@ public class ObservationBuilder {
     private float[] buildSigilState(ServerPlayer bot) {
         float[] state = new float[SIGIL_STATE_DIM];
 
-        if (!sigilsAvailable) return state; // all zeros
+        if (!sigilsAvailable || sigilsApi == null) return state; // all zeros
 
         org.bukkit.entity.Player bukkitPlayer = bot.getBukkitEntity();
-        Scoreboard scoreboard = Bukkit.getScoreboardManager().getMainScoreboard();
 
         for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
             int base = i * 4;
-            int slotNum = i + 1;
 
             // [0] ready ? 1 : 0
-            state[base] = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_slot" + slotNum + "_ready") == 1 ? 1f : 0f;
+            state[base] = sigilsApi.isSigilReady(bukkitPlayer, i) ? 1f : 0f;
 
             // [1] cooldown progress (0 = ready, 1 = full cd)
-            int cdRemaining = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_slot" + slotNum + "_cd");
-            int cdMax = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_slot" + slotNum + "_cdmax");
-            state[base + 1] = cdMax > 0 ? (float) cdRemaining / cdMax : 0f;
+            state[base + 1] = (float) sigilsApi.getCooldownProgress(bukkitPlayer, i);
 
             // [2] tier / 3
-            int tier = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_slot" + slotNum + "_tier");
+            int tier = sigilsApi.getTier(bukkitPlayer, i);
             state[base + 2] = tier / 3f;
 
-            // [3] time since used / 600
-            int ticksSinceUsed = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_slot" + slotNum + "_since");
-            state[base + 3] = Math.min(ticksSinceUsed / 600f, 1f);
+            // [3] cooldown remaining seconds / 30 (normalized)
+            double cdRemaining = sigilsApi.getCooldownRemaining(bukkitPlayer, i);
+            state[base + 3] = Math.min((float) (cdRemaining / 30.0), 1f);
         }
 
         return state;
@@ -474,7 +478,8 @@ public class ObservationBuilder {
         env[6] = totalEnemies > 0 ? (float) aliveEnemies / totalEnemies : 0f;
 
         // [7] episode progress
-        env[7] = maxEpisodeTicks > 0 ? (float) currentTick / maxEpisodeTicks : 0f;
+        int episodeTick = getCurrentTick() - episodeStartTick;
+        env[7] = maxEpisodeTicks > 0 ? (float) episodeTick / maxEpisodeTicks : 0f;
 
         return env;
     }
@@ -583,24 +588,20 @@ public class ObservationBuilder {
     //  ArcaneSigils integration via Bukkit scoreboard
     // ------------------------------------------------------------------
 
-    private static boolean checkSigilsAvailable() {
-        return Bukkit.getPluginManager().getPlugin("ArcaneSigils") != null;
-    }
-
     /**
-     * Read sigil combat state from scoreboard.
+     * Read sigil combat state from API.
      * Returns [damageAmp, damageReduction, kbCharges/10, invulnHits/10].
      */
     private float[] readSigilCombatState(ServerPlayer nmsPlayer) {
         float[] result = new float[4];
-        org.bukkit.entity.Player bukkitPlayer = nmsPlayer.getBukkitEntity();
-        Scoreboard scoreboard = Bukkit.getScoreboardManager().getMainScoreboard();
+        if (sigilsApi == null) return result;
 
-        // Read sigil combat amplifiers from scoreboard objectives
-        result[0] = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_dmg_amp") / 100f;
-        result[1] = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_dmg_red") / 100f;
-        result[2] = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_kb_charges") / 10f;
-        result[3] = readScoreboardInt(scoreboard, bukkitPlayer, "sigil_invuln") / 10f;
+        org.bukkit.entity.Player bukkitPlayer = nmsPlayer.getBukkitEntity();
+
+        result[0] = (float) sigilsApi.getDamageAmplifier(bukkitPlayer);
+        result[1] = (float) sigilsApi.getDamageReduction(bukkitPlayer);
+        result[2] = sigilsApi.getKingsBraceCharges(bukkitPlayer) / 10f;
+        result[3] = sigilsApi.getInvulnHits(bukkitPlayer) / 10f;
         return result;
     }
 
@@ -608,24 +609,12 @@ public class ObservationBuilder {
      * Check if an entity has a Pharaoh mark placed by the bot.
      */
     private boolean readPharaohMark(ServerPlayer bot, LivingEntity entity) {
+        if (sigilsApi == null) return false;
         if (!(entity instanceof ServerPlayer targetNms)) return false;
 
-        Scoreboard scoreboard = Bukkit.getScoreboardManager().getMainScoreboard();
+        org.bukkit.entity.Player botBukkit = bot.getBukkitEntity();
         org.bukkit.entity.Player targetBukkit = targetNms.getBukkitEntity();
 
-        // Pharaoh mark objective stores the marker's entity ID
-        int markerId = readScoreboardInt(scoreboard, targetBukkit, "sigil_pharaoh_mark");
-        return markerId == bot.getId();
-    }
-
-    /**
-     * Read an integer from a scoreboard objective for a player.
-     * Returns 0 if the objective doesn't exist or has no score.
-     */
-    private static int readScoreboardInt(Scoreboard scoreboard, org.bukkit.entity.Player player, String objectiveName) {
-        Objective objective = scoreboard.getObjective(objectiveName);
-        if (objective == null) return 0;
-        Score score = objective.getScore(player);
-        return score.isScoreSet() ? score.getScore() : 0;
+        return sigilsApi.isMarked(targetBukkit, botBukkit);
     }
 }

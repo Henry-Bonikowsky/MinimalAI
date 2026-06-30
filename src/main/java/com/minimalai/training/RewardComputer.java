@@ -1,10 +1,12 @@
 package com.minimalai.training;
 
+import com.minimalai.ai.ObservationBuilder;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.Map;
 import java.util.Set;
@@ -32,6 +34,12 @@ public class RewardComputer implements Listener {
     private final float sprintResetReward;
     private final float approachScale;
     private final float healthAdvantageScale;
+
+    // Optional observation builder to forward damage events for combat features
+    private @Nullable ObservationBuilder obsBuilder;
+
+    // Physics recorders to forward damage/KB events for recording sessions
+    private final Map<String, PhysicsRecorder> recorders = new ConcurrentHashMap<>();
 
     // --- Per-bot tracking ---
     private final Map<String, Float> pendingRewards = new ConcurrentHashMap<>();
@@ -109,6 +117,36 @@ public class RewardComputer implements Listener {
         return registeredBots.contains(name);
     }
 
+    /**
+     * Set the observation builder to forward damage events for combat features.
+     */
+    public void setObservationBuilder(@Nullable ObservationBuilder obsBuilder) {
+        this.obsBuilder = obsBuilder;
+    }
+
+    public void registerRecorder(String name, PhysicsRecorder recorder) {
+        recorders.put(name, recorder);
+    }
+
+    public void unregisterRecorder(String name) {
+        recorders.remove(name);
+    }
+
+    /**
+     * Direct damage notification — bypasses Bukkit event system which may not
+     * fire for NMS-level bot.attack() calls on fake players.
+     */
+    public void notifyDamageDealt(String botName, float amount) {
+        PhysicsRecorder rec = recorders.get(botName);
+        if (rec != null) rec.onDamageDealt(amount);
+    }
+
+    public void notifyDamageTaken(String botName, float amount, double vx, double vy, double vz,
+                                  boolean attackerSprinting) {
+        PhysicsRecorder rec = recorders.get(botName);
+        if (rec != null) rec.onDamageTaken(amount, vx, vy, vz, attackerSprinting);
+    }
+
     // ----------------------------------------------------------------
     //  Bukkit event handlers
     // ----------------------------------------------------------------
@@ -120,6 +158,13 @@ public class RewardComputer implements Listener {
             float dealt = (float) e.getFinalDamage();
             float reward = (dealt / 20.0f) * damageDealtScale;
             addReward(attacker.getName(), reward);
+            if (obsBuilder != null) {
+                obsBuilder.onDamageDealt(attacker.getName(), dealt);
+            }
+            PhysicsRecorder rec = recorders.get(attacker.getName());
+            if (rec != null) {
+                rec.onDamageDealt(dealt);
+            }
         }
 
         // Damage received by a registered bot
@@ -127,6 +172,18 @@ public class RewardComputer implements Listener {
             float taken = (float) e.getFinalDamage();
             float penalty = -(taken / 20.0f) * damageTakenScale;
             addReward(victim.getName(), penalty);
+            if (obsBuilder != null) {
+                obsBuilder.onDamageTaken(victim.getName(), taken);
+            }
+            PhysicsRecorder rec = recorders.get(victim.getName());
+            if (rec != null) {
+                boolean attackerSprinting = e.getDamager() instanceof Player p && p.isSprinting();
+                rec.onDamageTaken(taken,
+                        victim.getVelocity().getX(),
+                        victim.getVelocity().getY(),
+                        victim.getVelocity().getZ(),
+                        attackerSprinting);
+            }
         }
     }
 

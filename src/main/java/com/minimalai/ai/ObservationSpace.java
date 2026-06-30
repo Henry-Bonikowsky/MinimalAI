@@ -1,3 +1,4 @@
+// AUTO-GENERATED from dimensions.json -- DO NOT EDIT DIRECTLY
 package com.minimalai.ai;
 
 /**

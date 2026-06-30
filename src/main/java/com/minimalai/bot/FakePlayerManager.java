@@ -2,16 +2,19 @@ package com.minimalai.bot;
 
 import com.mojang.authlib.GameProfile;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.server.network.CommonListenerCookie;
+import net.minecraft.server.players.PlayerList;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
 
+import org.bukkit.metadata.FixedMetadataValue;
+import org.bukkit.plugin.Plugin;
+
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
@@ -19,40 +22,71 @@ import java.util.logging.Logger;
 /**
  * Manages the lifecycle of NMS fake players (bots).
  *
- * Each bot is a real ServerPlayer injected into the server's player list
- * so that it is visible to all online players, appears in tab, and can
- * interact with the world exactly like a human player.
+ * Uses the Imperium JAR's native fake player API (PlayerList.createFakePlayer /
+ * removeFakePlayer) via reflection. These methods handle all networking, entity
+ * tracking, and disconnect immunity server-side — no plugin-side hacks needed.
  */
 public class FakePlayerManager {
 
     private final Logger logger;
+    private final Plugin plugin;
     private final Map<String, BotContext> activeBots = new ConcurrentHashMap<>();
     private int nextBotId = 1;
 
-    public FakePlayerManager(Logger logger) {
+    // Cached reflection handles for Imperium JAR's native API
+    private Method createFakePlayerMethod;
+    private Method removeFakePlayerMethod;
+    private boolean nativeApiAvailable = false;
+
+    public FakePlayerManager(Logger logger, Plugin plugin) {
         this.logger = logger;
+        this.plugin = plugin;
+        initNativeApi();
+    }
+
+    private void initNativeApi() {
+        try {
+            createFakePlayerMethod = PlayerList.class.getMethod(
+                "createFakePlayer", ServerLevel.class, String.class,
+                double.class, double.class, double.class
+            );
+            removeFakePlayerMethod = PlayerList.class.getMethod(
+                "removeFakePlayer", ServerPlayer.class
+            );
+            nativeApiAvailable = true;
+            logger.info("Imperium native fake player API detected — using server-side bot support");
+        } catch (NoSuchMethodException e) {
+            nativeApiAvailable = false;
+            logger.severe("Imperium native fake player API NOT found — bots will not work!");
+            logger.severe("Ensure you are running the patched Imperium JAR with createFakePlayer/removeFakePlayer.");
+        }
     }
 
     /**
      * Spawn a fake player at the given location.
-     *
-     * @param world    Bukkit world to spawn in
-     * @param location spawn location (position + look direction)
-     * @param name     display name; if null a default "Bot_N" name is generated
-     * @return the BotContext wrapping the ServerPlayer, or null on failure
      */
     public BotContext spawn(World world, Location location, String name) {
+        return spawn(world, location, name, null);
+    }
+
+    /**
+     * Spawn a fake player with an optional pre-built GameProfile.
+     */
+    public BotContext spawn(World world, Location location, String name, GameProfile providedProfile) {
+        if (!nativeApiAvailable) {
+            logger.severe("Cannot spawn bot — Imperium native API not available");
+            return null;
+        }
+
         if (name == null || name.isBlank()) {
             name = "Bot_" + nextBotId++;
         }
 
-        // Prevent duplicate names
         if (activeBots.containsKey(name)) {
             logger.warning("Bot with name '" + name + "' already exists");
             return null;
         }
 
-        // Cap name length to 16 (Minecraft username limit)
         if (name.length() > 16) {
             name = name.substring(0, 16);
         }
@@ -61,44 +95,23 @@ public class FakePlayerManager {
             MinecraftServer server = ((CraftServer) Bukkit.getServer()).getServer();
             ServerLevel level = ((CraftWorld) world).getHandle();
 
-            // Build an offline-mode GameProfile with a random UUID
-            GameProfile profile = new GameProfile(UUID.randomUUID(), name);
-
-            // Create the ServerPlayer
-            // TODO: ClientInformation.createDefault() is the typical factory in 1.21.x.
-            //       If your Paper build names it differently, adjust here.
-            ServerPlayer bot = new ServerPlayer(server, level, profile, ClientInformation.createDefault());
-
-            // Position + look direction
-            bot.setPos(location.getX(), location.getY(), location.getZ());
-            bot.setYRot(location.getYaw());
-            bot.setXRot(location.getPitch());
-            bot.setYHeadRot(location.getYaw());
-
-            // Build a CommonListenerCookie for the login handshake.
-            // Paper 1.21.10 signature:
-            // CommonListenerCookie(GameProfile, int, ClientInformation, boolean, String, Set<String>, KeepAlive)
-            CommonListenerCookie cookie = new CommonListenerCookie(
-                profile,
-                0,                                    // latency (ms)
-                ClientInformation.createDefault(),
-                false,                                // transferred
-                "",                                   // client brand
-                java.util.Set.of(),                   // extra data
-                null                                  // KeepAlive (not needed for fake players)
+            // Call Imperium's PlayerList.createFakePlayer(level, name, x, y, z)
+            ServerPlayer bot = (ServerPlayer) createFakePlayerMethod.invoke(
+                server.getPlayerList(),
+                level, name, location.getX(), location.getY(), location.getZ()
             );
 
-            // Wire up fake networking (no-op packet handling)
-            FakeConnection fakeConn = FakeConnection.create(server, bot, cookie);
+            // Set rotation (createFakePlayer sets 0,0)
+            bot.snapTo(location.getX(), location.getY(), location.getZ(),
+                       location.getYaw(), location.getPitch());
 
-            // Register the bot with the server's player list.
-            // This fires PlayerJoinEvent, adds to tab list, etc.
-            // TODO: placeNewPlayer signature:
-            //       placeNewPlayer(Connection, ServerPlayer, CommonListenerCookie)
-            //       If Paper wraps this differently, adjust the call.
-            server.getPlayerList().placeNewPlayer(fakeConn.connection(), bot, cookie);
+            // Mark as NPC so other plugins (TAB, Citizens-compat, etc.) skip this player
+            bot.getBukkitEntity().setMetadata("NPC", new FixedMetadataValue(plugin, true));
 
-            BotContext ctx = new BotContext(name, bot, fakeConn);
+            // Sync position tracking
+            bot.connection.resetPosition();
+
+            BotContext ctx = new BotContext(name, bot);
             activeBots.put(name, ctx);
 
             logger.info("Spawned bot '" + name + "' at " + formatLocation(location));
@@ -113,9 +126,6 @@ public class FakePlayerManager {
 
     /**
      * Remove a bot from the server.
-     *
-     * @param name the bot's display name
-     * @return true if a bot with that name was found and removed
      */
     public boolean despawn(String name) {
         BotContext ctx = activeBots.remove(name);
@@ -125,11 +135,8 @@ public class FakePlayerManager {
             MinecraftServer server = ((CraftServer) Bukkit.getServer()).getServer();
             ServerPlayer bot = ctx.serverPlayer();
 
-            // Remove from the server's player list (fires PlayerQuitEvent, tab removal, etc.)
-            server.getPlayerList().remove(bot);
-
-            // Remove entity from the level
-            bot.discard();
+            // Call Imperium's PlayerList.removeFakePlayer(player)
+            removeFakePlayerMethod.invoke(server.getPlayerList(), bot);
 
             logger.info("Despawned bot '" + name + "'");
         } catch (Exception e) {
@@ -142,33 +149,25 @@ public class FakePlayerManager {
      * Remove all active bots. Intended for plugin disable / cleanup.
      */
     public void despawnAll() {
-        // Copy keys to avoid ConcurrentModificationException
         for (String name : new ArrayList<>(activeBots.keySet())) {
             despawn(name);
         }
     }
 
-    /**
-     * Look up a bot by name.
-     *
-     * @return the BotContext, or null if not found
-     */
     public BotContext getBot(String name) {
         return activeBots.get(name);
     }
 
-    /**
-     * @return an unmodifiable view of all active bots
-     */
     public Collection<BotContext> getAllBots() {
         return Collections.unmodifiableCollection(activeBots.values());
     }
 
-    /**
-     * @return number of active bots
-     */
     public int botCount() {
         return activeBots.size();
+    }
+
+    public boolean isBot(String name) {
+        return activeBots.containsKey(name);
     }
 
     private static String formatLocation(Location loc) {
@@ -177,18 +176,11 @@ public class FakePlayerManager {
             loc.getWorld() != null ? loc.getWorld().getName() : "?");
     }
 
-    // ------------------------------------------------------------------
-    //  Inner record that bundles a bot's NMS player + networking handles
-    // ------------------------------------------------------------------
-
     /**
      * Lightweight wrapper around a bot's server-side state.
      */
-    public record BotContext(String name, ServerPlayer serverPlayer, FakeConnection fakeConnection) {
+    public record BotContext(String name, ServerPlayer serverPlayer) {
 
-        /**
-         * @return the bot's current Bukkit Location
-         */
         public Location bukkitLocation() {
             return serverPlayer.getBukkitEntity().getLocation();
         }

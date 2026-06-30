@@ -1,0 +1,118 @@
+================================================================================
+MINIMALAI COUPLING AUDIT — EXECUTIVE SUMMARY
+================================================================================
+
+SITUATION
+---------
+Your codebase works great for 1v1 combat. But it's brittle for iteration because
+action and observation dimensions are hardcoded in 8-12 files across Java and Python.
+
+Every time you want to add a feature (new sigil, teammate HP, consumable),
+you manually update both codebases, retrain all models, and invalidate 4000+
+checkpoints.
+
+This becomes a showstopper for Legion mode (20 coordinated bots).
+
+
+CORE PROBLEM
+------------
+Constants treated as "final" when they're obviously "version 1":
+- 35 actions (too few for Legion)
+- 320 observations (no team awareness)
+- 8 entity slots (can't fit 19 teammates)
+- 128-dim hidden state (magic number in 3 places)
+
+No single source of truth → Java ActionSpace.java and Python config.py
+independently define action indices. Easy to drift.
+
+No model versioning → .pt files have no metadata about expected input/output
+shapes. First inference that fails reveals incompatibility (mid-fight is bad).
+
+
+SEVERITY BREAKDOWN
+------------------
+CRITICAL (breaks builds, cascades everywhere):
+  1. Action space hardcoding (35 actions in 8 files)
+  2. Observation dimension hardcoding (320 dims in 6 files)
+
+HIGH (causes silent runtime failures):
+  3. Zero model schema validation
+  4. Hidden state size magic number (128)
+
+MEDIUM (causes mismatches):
+  5. Sigil slot indices hardcoded in Java
+  6. Consumable counts scattered across 3 files
+
+
+RECOMMENDED FIXES (In Order)
+----------------------------
+
+Priority 1: Add Model Metadata (20 min, HIGH impact)
+  - Embed observation/action spec in exported .pt files
+  - Validate at load time → catch incompatibility early
+  - No other files need to change
+
+Priority 2: Config-Driven Dimensions (2-3 hours, CRITICAL)
+  - Create dimensions.json (single source of truth)
+  - Auto-generate ActionSpace.java and Python config from JSON
+  - Change one file, both sides auto-sync
+  - Foundation for Legion mode
+
+Priority 3: Observation Slots Class (25 min, Quick Win)
+  - Replace magic indices (s[0], s[24]) with named constants
+  - Improves readability immediately
+  - Enables schema validation later
+
+Priority 4: Action Space Config (2-3 hours, MEDIUM)
+  - Define actions, masking, forced bits in YAML
+  - Auto-generate handler methods
+  - Prep for Legion's new action types
+
+
+EFFORT vs PAYOFF
+----------------
+Implementation time: 8-10 hours total
+Cost per feature after: 1 hour instead of 8
+Payoff timeframe: 2-3 new features (then break-even)
+ROI over Legion mode: 10x (can't do Legion without this)
+
+
+WHAT HAPPENS IF YOU DON'T FIX THIS
+----------------------------------
+Legion mode (20 coordinated bots) requires:
+  - New observation fields (team status, role, objective)
+  - Larger entity buffer (19 teammates + 20 enemies)
+  - New action types (SUPPORT_HEAL, FOLLOW_ALLY, etc.)
+  - New network architecture (team attention heads)
+  - New reward system (shared team objectives)
+
+With current architecture:
+  - Each change invalidates all checkpoints
+  - Can't add features without breaking existing deployments
+  - Backward compatibility becomes impossible
+  - Training pipeline and server code diverge
+
+With fixes applied:
+  - Dimensions are data-driven (change JSON, build auto-syncs)
+  - Old single-opponent code path still works
+  - New multi-agent code path runs in parallel
+  - Backward compatibility is maintainable
+
+
+NEXT STEPS
+----------
+1. Read COUPLING_AUDIT.md for full technical details
+2. Read FIXING_COUPLING.md for implementation recipes
+3. Implement Priority 1 (20 min) + Priority 2 (2-3 hours) first
+4. Then tackle Legion mode
+
+If you have questions on any specific issue:
+  - COUPLING_AUDIT.md: Full problem analysis with code locations
+  - FIXING_COUPLING.md: Copy-paste implementation code
+
+
+FILES CREATED
+-------------
+- COUPLING_AUDIT.md: Complete technical analysis
+- FIXING_COUPLING.md: Implementation recipes with examples
+- COUPLING_SUMMARY.txt: This file

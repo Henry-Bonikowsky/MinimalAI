@@ -31,6 +31,10 @@ __pycache__/
 .venv/
 venv/
 
+# Credentials
+.mcp.json
+server.properties.tmp
+
 # Session files
 session-state.md
 scratch/

@@ -13,10 +13,13 @@ import net.minecraft.world.item.Items;
 import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.alchemy.Potions;
 import net.minecraft.world.phys.Vec3;
+import com.minimalai.training.RewardComputer;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 import static com.minimalai.ai.ActionSpace.*;
@@ -59,16 +62,24 @@ public class ActionExecutor {
         boolean isReady(Player player, int slotIndex);
     }
 
-    // Approximate walk/sprint speeds in blocks/tick (matching sim values)
-    private static final float WALK_SPEED = 0.1f;
-    private static final float SPRINT_SPEED = 0.26f;
+    // Vanilla melee reach and max angle for hit registration
+    private static final double MELEE_REACH = 3.0;
+    private static final double MELEE_ANGLE_COS = Math.cos(Math.toRadians(60)); // ~60° cone
 
     private final @Nullable ArcaneSigilsAPI sigilsApi;
     private final @Nullable SigilCooldownQuery sigilCooldowns;
 
-    // Eating state: golden apple takes 32 ticks to consume
-    private int eatingTicksRemaining = 0;
-    private InteractionHand eatingHand = null;
+    // Per-bot eating state (keyed by entity ID since ActionExecutor is shared)
+    private static class EatingState {
+        int ticksRemaining = 0;
+        InteractionHand hand = null;
+        int originalSlot = 0; // hotbar slot to restore after eating
+    }
+    private final Map<Integer, EatingState> eatingStates = new ConcurrentHashMap<>();
+
+    // Per-execution context (set at start of execute, cleared at end)
+    private @Nullable RewardComputer rewardCtx;
+    private @Nullable String rewardBotName;
 
     /**
      * @param sigilsApi      nullable; set if ArcaneSigils is loaded
@@ -105,12 +116,29 @@ public class ActionExecutor {
                                           int[] actions,
                                           @Nullable LivingEntity target,
                                           List<LivingEntity> nearbyEntities) {
+        return execute(bot, actions, target, nearbyEntities, null, null);
+    }
+
+    /**
+     * Apply actions with optional reward feedback for action-quality signals.
+     */
+    public @Nullable LivingEntity execute(ServerPlayer bot,
+                                          int[] actions,
+                                          @Nullable LivingEntity target,
+                                          List<LivingEntity> nearbyEntities,
+                                          @Nullable RewardComputer rewards,
+                                          @Nullable String botName) {
+        // Set per-execution reward context
+        this.rewardCtx = rewards;
+        this.rewardBotName = botName;
 
         applyMovement(bot, actions);
         applyJump(bot, actions);
         applySneak(bot, actions);
         applySprint(bot, actions);
-        applySprintReset(bot, actions);
+        applySprintReset(bot, actions, target);
+        // Look BEFORE attack so the bot faces the target first
+        applyLookIntent(bot, actions, target);
         applyAttack(bot, actions, target);
         applyBlock(bot, actions);
         applyEatGap(bot, actions);
@@ -118,9 +146,12 @@ public class ActionExecutor {
         applyThrowPearl(bot, actions);
         // ACT_SWAP_WEAPON (13) is always masked -- no-op
         applySigils(bot, actions);
-        applyLook(bot, actions);
 
         tickEating(bot);
+
+        // Clear per-execution context
+        this.rewardCtx = null;
+        this.rewardBotName = null;
 
         return resolveTarget(actions, target, nearbyEntities);
     }
@@ -130,24 +161,17 @@ public class ActionExecutor {
     // ------------------------------------------------------------------
 
     private void applyMovement(ServerPlayer bot, int[] actions) {
-        float forward = actions[ACT_FORWARD] - actions[ACT_BACKWARD]; // -1, 0, or 1
-        float strafe = actions[ACT_STRAFE_LEFT] - actions[ACT_STRAFE_RIGHT]; // -1, 0, or 1
+        // Set vanilla input fields — LivingEntity.travel() handles all physics,
+        // including gravity, friction, knockback, and collisions.
+        bot.zza = actions[ACT_FORWARD] - actions[ACT_BACKWARD];
+        bot.xxa = actions[ACT_STRAFE_LEFT] - actions[ACT_STRAFE_RIGHT];
+    }
 
-        if (forward == 0 && strafe == 0) {
-            // No movement input -- keep vertical momentum, zero horizontal
-            Vec3 current = bot.getDeltaMovement();
-            bot.setDeltaMovement(0, current.y, 0);
-            return;
-        }
-
-        float yawRad = (float) Math.toRadians(bot.getYRot());
-        float speed = bot.isSprinting() ? SPRINT_SPEED : WALK_SPEED;
-
-        double dx = (-Math.sin(yawRad) * forward + Math.cos(yawRad) * strafe) * speed;
-        double dz = (Math.cos(yawRad) * forward + Math.sin(yawRad) * strafe) * speed;
-
-        Vec3 current = bot.getDeltaMovement();
-        bot.setDeltaMovement(dx, current.y, dz);
+    /**
+     * Clean up per-bot tracking state when a bot is removed.
+     */
+    public void clearBotState(int entityId) {
+        eatingStates.remove(entityId);
     }
 
     // ------------------------------------------------------------------
@@ -155,9 +179,8 @@ public class ActionExecutor {
     // ------------------------------------------------------------------
 
     private void applyJump(ServerPlayer bot, int[] actions) {
-        if (actions[ACT_JUMP] == 1 && bot.onGround()) {
-            bot.jumpFromGround();
-        }
+        // Set vanilla jumping flag — LivingEntity.aiStep() handles ground check
+        bot.setJumping(actions[ACT_JUMP] == 1);
     }
 
     // ------------------------------------------------------------------
@@ -180,10 +203,16 @@ public class ActionExecutor {
     //  Sprint Reset (action 12) -- same-tick toggle for KB boost
     // ------------------------------------------------------------------
 
-    private void applySprintReset(ServerPlayer bot, int[] actions) {
+    private void applySprintReset(ServerPlayer bot, int[] actions,
+                                   @Nullable LivingEntity target) {
         if (actions[ACT_SPRINT_RESET] == 1) {
             bot.setSprinting(false);
             bot.setSprinting(true);
+
+            if (rewardCtx != null && rewardBotName != null && target != null) {
+                float dist = (float) bot.distanceTo(target);
+                rewardCtx.onBotSprintReset(rewardBotName, dist);
+            }
         }
     }
 
@@ -193,8 +222,114 @@ public class ActionExecutor {
 
     private void applyAttack(ServerPlayer bot, int[] actions,
                              @Nullable LivingEntity target) {
-        if (actions[ACT_ATTACK] == 1 && target != null && target.isAlive()) {
-            bot.attack(target); // vanilla damage calc, knockback, crits
+        if (actions[ACT_ATTACK] != 1 || target == null || !target.isAlive()) return;
+
+        // Don't attack while eating (golden apple is in main hand)
+        EatingState es = eatingStates.get(bot.getId());
+        if (es != null && es.ticksRemaining > 0) return;
+
+        // Must be holding a sword to attack effectively
+        if (!isSword(bot.getMainHandItem())) return;
+
+        // Range check: vanilla player reach is ~3 blocks
+        double dist = bot.distanceTo(target);
+        boolean inRange = dist <= MELEE_REACH;
+
+        if (!inRange) {
+            if (rewardCtx != null && rewardBotName != null) {
+                rewardCtx.onBotAttack(rewardBotName, false, false);
+            }
+            return;
+        }
+
+        // Angle check: bot must be roughly facing the target
+        double dx = target.getX() - bot.getX();
+        double dz = target.getZ() - bot.getZ();
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        if (horizDist > 0.01) {
+            float yawRad = (float) Math.toRadians(bot.getYRot());
+            double lookX = -Math.sin(yawRad);
+            double lookZ = Math.cos(yawRad);
+            double dot = (lookX * dx + lookZ * dz) / horizDist;
+            if (dot < MELEE_ANGLE_COS) {
+                if (rewardCtx != null && rewardBotName != null) {
+                    rewardCtx.onBotAttack(rewardBotName, false, false);
+                }
+                return;
+            }
+        }
+
+        // I-frame check: skip damage if target was recently hit
+        if (target.invulnerableTime > 0) {
+            if (rewardCtx != null && rewardBotName != null) {
+                rewardCtx.onBotAttack(rewardBotName, false, true);
+            }
+            return;
+        }
+
+        float baseDmg = (float) bot.getAttributeValue(net.minecraft.world.entity.ai.attributes.Attributes.ATTACK_DAMAGE);
+        float preHp = target.getHealth() + target.getAbsorptionAmount();
+
+        // Direct damage: server's damage event pipeline is blocked for fake players
+        // (plugin listeners cancel EntityDamageByEntityEvent), so we apply damage manually.
+        float dmg = baseDmg;
+        // Armor reduction (simplified): DR = armor * 0.04, capped at 80%
+        if (target instanceof ServerPlayer tp) {
+            float armor = (float) tp.getArmorValue();
+            float reduction = Math.min(armor * 0.04f, 0.8f);
+            dmg *= (1.0f - reduction);
+        }
+        // Crit bonus: if bot is falling
+        if (bot.fallDistance > 0 && !bot.onGround()) {
+            dmg *= 1.5f;
+        }
+        // Sprint knockback bonus
+        boolean sprintHit = bot.isSprinting();
+        // Apply to absorption first, then health
+        float absorption = target.getAbsorptionAmount();
+        if (absorption > 0) {
+            float absorbDmg = Math.min(absorption, dmg);
+            target.setAbsorptionAmount(absorption - absorbDmg);
+            dmg -= absorbDmg;
+        }
+        if (dmg > 0) {
+            float newHealth = target.getHealth() - dmg;
+            // Kill threshold: if health would drop below 1.0, force death
+            // Prevents near-death stalemates where armor reduction asymptotically approaches 0
+            if (newHealth < 1.0f) newHealth = 0;
+            target.setHealth(Math.max(0, newHealth));
+        }
+        // Force death state if health reached 0 (setHealth(0) alone doesn't kill)
+        if (target.getHealth() <= 0) {
+            try {
+                java.lang.reflect.Field deadField =
+                    net.minecraft.world.entity.LivingEntity.class.getDeclaredField("dead");
+                deadField.setAccessible(true);
+                deadField.setBoolean(target, true);
+            } catch (Exception ignored) {}
+        }
+        // Apply knockback (away from attacker)
+        double kbX = target.getX() - bot.getX();
+        double kbZ = target.getZ() - bot.getZ();
+        double kbDist = Math.sqrt(kbX * kbX + kbZ * kbZ);
+        if (kbDist > 0.001) {
+            double kbStrength = sprintHit ? 0.9 : 0.4;
+            target.setDeltaMovement(
+                target.getDeltaMovement().add(kbX / kbDist * kbStrength, 0.36, kbZ / kbDist * kbStrength)
+            );
+        }
+        // Set hurt animation + i-frames
+        target.invulnerableTime = 10;
+        target.hurtDuration = 10;
+        target.hurtTime = 10;
+        float postHp = target.getHealth() + target.getAbsorptionAmount();
+        float dealt = Math.max(0, preHp - postHp);
+
+        if (rewardCtx != null && rewardBotName != null) {
+            rewardCtx.onBotAttack(rewardBotName, dealt > 0, false);
+            if (dealt > 0) {
+                rewardCtx.notifyDamageDealt(rewardBotName, dealt);
+            }
         }
     }
 
@@ -229,28 +364,41 @@ public class ActionExecutor {
 
     private void applyEatGap(ServerPlayer bot, int[] actions) {
         if (actions[ACT_EAT_GAP] != 1) return;
-        if (eatingTicksRemaining > 0) return; // already eating
+        EatingState es = eatingStates.computeIfAbsent(bot.getId(), k -> new EatingState());
+        if (es.ticksRemaining > 0) return; // already eating
 
         // Find a golden apple in inventory
         int slot = findItemSlot(bot, stack ->
                 stack.is(Items.GOLDEN_APPLE) || stack.is(Items.ENCHANTED_GOLDEN_APPLE));
         if (slot == -1) return;
 
+        // Remember current slot to restore after eating
+        es.originalSlot = bot.getBukkitEntity().getInventory().getHeldItemSlot();
+
         // Move the apple to main hand and start using
         swapToSlot(bot, slot);
         bot.startUsingItem(InteractionHand.MAIN_HAND);
-        eatingTicksRemaining = 32; // golden apple use time
-        eatingHand = InteractionHand.MAIN_HAND;
+        es.ticksRemaining = 32; // golden apple use time
+        es.hand = InteractionHand.MAIN_HAND;
+
+        // Reward callback for gap timing
+        if (rewardCtx != null && rewardBotName != null) {
+            float healthRatio = bot.getHealth() / bot.getMaxHealth();
+            rewardCtx.onBotUseGap(rewardBotName, healthRatio);
+        }
     }
 
-    /** Tick down eating state; stop using when done. */
+    /** Tick down eating state; restore original slot when done. */
     private void tickEating(ServerPlayer bot) {
-        if (eatingTicksRemaining <= 0) return;
-        eatingTicksRemaining--;
-        if (eatingTicksRemaining == 0) {
+        EatingState es = eatingStates.get(bot.getId());
+        if (es == null || es.ticksRemaining <= 0) return;
+        es.ticksRemaining--;
+        if (es.ticksRemaining == 0) {
             // Let vanilla finish the use (completeUsingItem is called automatically
             // by the server when useItemRemainingTicks reaches 0).
-            eatingHand = null;
+            es.hand = null;
+            // Swap back to original slot (usually the sword)
+            bot.getBukkitEntity().getInventory().setHeldItemSlot(es.originalSlot);
         }
     }
 
@@ -283,6 +431,12 @@ public class ActionExecutor {
         if (potStack.isEmpty()) {
             bot.getInventory().setItem(slot, ItemStack.EMPTY);
         }
+
+        // Reward callback for pot timing
+        if (rewardCtx != null && rewardBotName != null) {
+            float healthRatio = bot.getHealth() / bot.getMaxHealth();
+            rewardCtx.onBotUsePot(rewardBotName, healthRatio);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -307,6 +461,9 @@ public class ActionExecutor {
 
         level.addFreshEntity(pearl);
 
+        // Apply vanilla pearl cooldown (20 ticks = 1 second)
+        bot.getCooldowns().addCooldown(pearlStack, 20);
+
         // Consume the item
         pearlStack.shrink(1);
         if (pearlStack.isEmpty()) {
@@ -318,39 +475,76 @@ public class ActionExecutor {
     //  Sigil abilities (actions 14-25)
     // ------------------------------------------------------------------
 
+    // Active ability slots: neural net output [0-3] → ArcaneSigils bind slot
+    // [0]=brace(1), [1]=cleopatra(2), [2]=quicksand(3), [3]=grace(5)
+    // Matches BotBrain.ACTIVE_ABILITY_SLOTS
+    private static final int[] ACTIVE_ABILITY_SLOTS = {1, 2, 3, 5};
+
     private void applySigils(ServerPlayer bot, int[] actions) {
         if (sigilsApi == null) return;
+        Player p = getBukkitPlayer(bot);
+        if (p == null) return;
 
-        Player bukkitPlayer = getBukkitPlayer(bot);
-        if (bukkitPlayer == null) return;
-
-        for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
+        for (int i = 0; i < ACTIVE_ABILITY_SLOTS.length; i++) {
             if (actions[ACT_SIGIL_0 + i] == 1) {
-                sigilsApi.activateAbility(bukkitPlayer, i);
+                boolean fired = sigilsApi.activateAbility(p, ACTIVE_ABILITY_SLOTS[i]);
+                if (fired) {
+                    LOGGER.fine("[Sigil] " + bot.getScoreboardName() + " activated slot " + ACTIVE_ABILITY_SLOTS[i]);
+                }
             }
         }
     }
 
     // ------------------------------------------------------------------
-    //  Camera / Look (actions 26-29)
+    //  Camera intent (actions 26-29)
+    //  Priority: FACE_TARGET > FACE_AWAY > LOOK_DOWN_SELF > FACE_MOVEMENT
     // ------------------------------------------------------------------
 
-    private void applyLook(ServerPlayer bot, int[] actions) {
-        float yawDelta = 0f;
-        float pitchDelta = 0f;
-
-        if (actions[ACT_LOOK_LEFT] == 1)  yawDelta  -= CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_RIGHT] == 1) yawDelta  += CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_UP] == 1)    pitchDelta -= CAMERA_STEP_DEGREES;
-        if (actions[ACT_LOOK_DOWN] == 1)  pitchDelta += CAMERA_STEP_DEGREES;
-
-        if (yawDelta != 0f || pitchDelta != 0f) {
-            float newYaw = bot.getYRot() + yawDelta;
-            float newPitch = Math.clamp(bot.getXRot() + pitchDelta, -90f, 90f);
-            bot.setYRot(newYaw);
-            bot.setXRot(newPitch);
-            bot.setYHeadRot(newYaw);
+    private void applyLookIntent(ServerPlayer bot, int[] actions,
+                                  @Nullable LivingEntity target) {
+        if (actions[ACT_FACE_TARGET] == 1 && target != null && target.isAlive()) {
+            lookAt(bot, target.getX(), target.getEyeY(), target.getZ());
+        } else if (actions[ACT_FACE_AWAY] == 1 && target != null && target.isAlive()) {
+            // Look directly opposite of target
+            float yawToTarget = getYawToward(bot, target.getX(), target.getZ());
+            bot.setYRot(yawToTarget + 180f);
+            bot.setXRot(0f); // level pitch for running
+            bot.setYHeadRot(bot.getYRot());
+        } else if (actions[ACT_LOOK_DOWN_SELF] == 1) {
+            // Look at own feet for self-potting
+            bot.setXRot(89f);
+            bot.setYHeadRot(bot.getYRot());
+        } else if (actions[ACT_FACE_MOVEMENT] == 1) {
+            // Face movement direction
+            Vec3 vel = bot.getDeltaMovement();
+            if (vel.x * vel.x + vel.z * vel.z > 0.001) {
+                float moveYaw = (float) (Math.toDegrees(Math.atan2(-vel.x, vel.z)));
+                bot.setYRot(moveYaw);
+                bot.setXRot(0f);
+                bot.setYHeadRot(moveYaw);
+            }
         }
+        // If no intent is active, hold current look direction
+    }
+
+    private void lookAt(ServerPlayer bot, double x, double y, double z) {
+        double dx = x - bot.getX();
+        double dy = y - bot.getEyeY();
+        double dz = z - bot.getZ();
+        double dist = Math.sqrt(dx * dx + dz * dz);
+
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float pitch = (float) -Math.toDegrees(Math.atan2(dy, dist));
+
+        bot.setYRot(yaw);
+        bot.setXRot(Math.clamp(pitch, -90f, 90f));
+        bot.setYHeadRot(yaw);
+    }
+
+    private float getYawToward(ServerPlayer bot, double x, double z) {
+        double dx = x - bot.getX();
+        double dz = z - bot.getZ();
+        return (float) Math.toDegrees(Math.atan2(-dx, dz));
     }
 
     // ------------------------------------------------------------------
@@ -385,7 +579,7 @@ public class ActionExecutor {
     public float[] buildActionMask(ServerPlayer bot) {
         float[] mask = new float[NUM_ACTIONS];
 
-        // Movement, sprint, sneak, look, sprint-reset are always valid
+        // Movement, sprint, sneak, look intents, sprint-reset are always valid
         mask[ACT_FORWARD] = 1f;
         mask[ACT_BACKWARD] = 1f;
         mask[ACT_STRAFE_LEFT] = 1f;
@@ -394,10 +588,10 @@ public class ActionExecutor {
         mask[ACT_SPRINT] = 1f;
         mask[ACT_SPRINT_RESET] = 1f;
 
-        mask[ACT_LOOK_LEFT] = 1f;
-        mask[ACT_LOOK_RIGHT] = 1f;
-        mask[ACT_LOOK_UP] = 1f;
-        mask[ACT_LOOK_DOWN] = 1f;
+        mask[ACT_FACE_TARGET] = 1f;
+        mask[ACT_FACE_AWAY] = 1f;
+        mask[ACT_LOOK_DOWN_SELF] = 1f;
+        mask[ACT_FACE_MOVEMENT] = 1f;
 
         // Jump: only if on ground
         mask[ACT_JUMP] = bot.onGround() ? 1f : 0f;
@@ -418,23 +612,26 @@ public class ActionExecutor {
         mask[ACT_THROW_POT] = hasItem(bot, stack ->
                 stack.is(Items.SPLASH_POTION) && isHealingPotion(stack)) ? 1f : 0f;
 
-        // Throw ender pearl
-        mask[ACT_THROW_PEARL] = hasItem(bot, stack -> stack.is(Items.ENDER_PEARL)) ? 1f : 0f;
+        // Throw ender pearl (must have item AND not on cooldown)
+        boolean hasPearl = hasItem(bot, stack -> stack.is(Items.ENDER_PEARL));
+        boolean pearlOnCooldown = bot.getCooldowns().isOnCooldown(new ItemStack(Items.ENDER_PEARL));
+        mask[ACT_THROW_PEARL] = (hasPearl && !pearlOnCooldown) ? 1f : 0f;
 
         // Swap weapon: always masked
         mask[ACT_SWAP_WEAPON] = 0f;
 
-        // Sigil slots
-        Player bukkitPlayer = getBukkitPlayer(bot);
-        for (int i = 0; i < NUM_SIGIL_SLOTS; i++) {
-            if (sigilsApi == null || bukkitPlayer == null) {
-                mask[ACT_SIGIL_0 + i] = 0f;
-            } else if (sigilCooldowns != null) {
-                mask[ACT_SIGIL_0 + i] = sigilCooldowns.isReady(bukkitPlayer, i) ? 1f : 0f;
-            } else {
-                // No cooldown query available; optimistically unmask
-                mask[ACT_SIGIL_0 + i] = 1f;
+        // Sigil slots: unmask active abilities based on cooldown readiness
+        if (sigilCooldowns != null) {
+            Player bukkitPlayer = getBukkitPlayer(bot);
+            if (bukkitPlayer != null) {
+                for (int i = 0; i < ACTIVE_ABILITY_SLOTS.length; i++) {
+                    mask[ACT_SIGIL_0 + i] = sigilCooldowns.isReady(bukkitPlayer, ACTIVE_ABILITY_SLOTS[i]) ? 1f : 0f;
+                }
             }
+        }
+        // Remaining sigil slots (beyond our 4 actives) stay masked
+        for (int i = ACTIVE_ABILITY_SLOTS.length; i < NUM_SIGIL_SLOTS; i++) {
+            mask[ACT_SIGIL_0 + i] = 0f;
         }
 
         // Target selection: unmask slots that have a live entity
@@ -561,7 +758,7 @@ public class ActionExecutor {
             "SPRINT_RESET", "SWAP_WPN",
             "SIG0", "SIG1", "SIG2", "SIG3", "SIG4", "SIG5",
             "SIG6", "SIG7", "SIG8", "SIG9", "SIG10", "SIG11",
-            "LOOK_L", "LOOK_R", "LOOK_UP", "LOOK_DN",
+            "FACE_TGT", "FACE_AWAY", "LOOK_DN_SELF", "FACE_MOVE",
             "TGT0", "TGT1", "TGT2", "TGT3", "TGT4"
         };
         StringBuilder sb = new StringBuilder();

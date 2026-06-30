@@ -43,11 +43,11 @@ ACT_SWAP_WEAPON = 13   # switch sword <-> axe
 ACT_SIGIL_0 = 14
 ACT_SIGIL_11 = 25
 
-# Camera
-ACT_LOOK_LEFT = 26
-ACT_LOOK_RIGHT = 27
-ACT_LOOK_UP = 28
-ACT_LOOK_DOWN = 29
+# Camera intent (priority: FACE_TARGET > FACE_AWAY > LOOK_DOWN_SELF > FACE_MOVEMENT)
+ACT_FACE_TARGET = 26     # snap look at combat target
+ACT_FACE_AWAY = 27       # look opposite of target (kiting)
+ACT_LOOK_DOWN_SELF = 28  # look at feet (self-pot)
+ACT_FACE_MOVEMENT = 29   # face movement direction
 
 # Direct target selection
 ACT_TARGET_0 = 30
@@ -402,16 +402,25 @@ class CombatEnv(gym.Env):
 
         self.physics.apply_movement(agent, forward, strafe, bool(action[ACT_JUMP]))
 
-        # Camera
-        turn_speed = np.pi / 18  # 10 degrees per tick
-        if action[ACT_LOOK_LEFT]:
-            self.physics.turn_agent(agent, -turn_speed)
-        if action[ACT_LOOK_RIGHT]:
-            self.physics.turn_agent(agent, turn_speed)
-
-        # Auto-face target if no manual camera
-        if not action[ACT_LOOK_LEFT] and not action[ACT_LOOK_RIGHT]:
-            target = self._get_target_for(agent)
+        # Camera intent (priority: FACE_TARGET > FACE_AWAY > LOOK_DOWN_SELF > FACE_MOVEMENT)
+        target = self._get_target_for(agent)
+        if action[ACT_FACE_TARGET] and target is not None:
+            self.physics.face_toward(agent, target, max_turn=np.pi)  # instant snap
+        elif action[ACT_FACE_AWAY] and target is not None:
+            # Face directly opposite of target
+            dx = target.x - agent.x
+            dz = target.z - agent.z
+            away_angle = np.arctan2(dz, dx) + np.pi
+            agent.facing_angle = (away_angle + np.pi) % (2 * np.pi) - np.pi
+        elif action[ACT_LOOK_DOWN_SELF]:
+            pass  # In 2D sim, no pitch — no-op but semantically "self-pot aiming"
+        elif action[ACT_FACE_MOVEMENT]:
+            # Face movement direction
+            speed_sq = agent.vx ** 2 + agent.vz ** 2
+            if speed_sq > 0.001:
+                agent.facing_angle = np.arctan2(agent.vz, agent.vx)
+        else:
+            # No intent active: soft auto-face target (smooth tracking)
             if target is not None:
                 self.physics.face_toward(agent, target, max_turn=np.pi / 6)
 

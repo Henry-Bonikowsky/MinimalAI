@@ -60,21 +60,28 @@ public class ModelManager implements AutoCloseable {
             throw new IOException("Model file not found: " + modelPath);
         }
 
-        Criteria<NDList, NDList> criteria = Criteria.builder()
-                .setTypes(NDList.class, NDList.class)
-                .optModelPath(modelPath)
-                .optEngine("PyTorch")
-                .optTranslator(new NoopTranslator())
-                .build();
+        // Paper uses per-plugin classloaders; DJL's ServiceLoader needs ours
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+        try {
+            Criteria<NDList, NDList> criteria = Criteria.builder()
+                    .setTypes(NDList.class, NDList.class)
+                    .optModelPath(modelPath)
+                    .optEngine("PyTorch")
+                    .optTranslator(new NoopTranslator())
+                    .build();
 
-        ZooModel<NDList, NDList> model = criteria.loadModel();
+            ZooModel<NDList, NDList> model = criteria.loadModel();
 
-        ZooModel<NDList, NDList> old = loadedModels.put(name, model);
-        if (old != null) {
-            old.close();
+            ZooModel<NDList, NDList> old = loadedModels.put(name, model);
+            if (old != null) {
+                old.close();
+            }
+
+            logger.info("Loaded model: " + name + " from " + modelPath);
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
         }
-
-        logger.info("Loaded model: " + name + " from " + modelPath);
     }
 
     /**
@@ -118,24 +125,56 @@ public class ModelManager implements AutoCloseable {
                                  float[] envState,
                                  float[] hidden) throws Exception {
 
-        NDList input = new NDList(
-                TensorUtil.toNDArray(manager, selfState, 1, 38),
-                TensorUtil.toNDArray(manager, entityFeatures, 1, 8, 24),
-                TensorUtil.toNDArray(manager, entityMask, 1, 8),
-                TensorUtil.toNDArray(manager, combatCtx, 1, 26),
-                TensorUtil.toNDArray(manager, sigilState, 1, 48),
-                TensorUtil.toNDArray(manager, envState, 1, 8),
-                TensorUtil.toNDArray(manager, hidden, 1, 1, GRU_HIDDEN_DIM)
-        );
+        // Use a per-inference sub-manager so all tensors are freed after
+        // extracting the float[] results. Without this, native NDArrays
+        // accumulate under the base manager and leak off-heap memory.
+        try (NDManager tickManager = manager.newSubManager()) {
+            NDList input = new NDList(
+                    TensorUtil.toNDArray(tickManager, selfState, 1, 38),
+                    TensorUtil.toNDArray(tickManager, entityFeatures, 1, 8, 24),
+                    TensorUtil.toNDArray(tickManager, entityMask, 1, 8),
+                    TensorUtil.toNDArray(tickManager, combatCtx, 1, 26),
+                    TensorUtil.toNDArray(tickManager, sigilState, 1, 48),
+                    TensorUtil.toNDArray(tickManager, envState, 1, 8),
+                    TensorUtil.toNDArray(tickManager, hidden, 1, 1, GRU_HIDDEN_DIM)
+            );
 
-        NDList output = predictor.predict(input);
+            NDList output = predictor.predict(input);
 
-        // InferenceWrapper returns: action_probs (1,35), value (1,1), new_hidden (1,1,128)
-        float[] actionProbs = TensorUtil.toFloatArray(output.get(0));
-        float value = output.get(1).toFloatArray()[0];
-        float[] newHidden = TensorUtil.toFloatArray(output.get(2));
+            // Extract float arrays before the sub-manager closes the NDArrays
+            float[] actionProbs = TensorUtil.toFloatArray(output.get(0));
+            float value = output.get(1).toFloatArray()[0];
+            float[] newHidden = TensorUtil.toFloatArray(output.get(2));
 
-        return new InferenceResult(actionProbs, value, newHidden);
+            return new InferenceResult(actionProbs, value, newHidden);
+        }
+        // tickManager.close() frees all input + output NDArrays
+    }
+
+    /**
+     * Run inference for the sigil network (simpler 2-input signature).
+     *
+     * @param predictor sigil model predictor
+     * @param manager   NDManager for tensor allocation
+     * @param obs       (20,) sigil observation
+     * @param mask      (7,) action mask (1=ready, 0=cooldown)
+     * @return float[7] probabilities for each sigil ability
+     */
+    public float[] inferSigil(Predictor<NDList, NDList> predictor,
+                               NDManager manager,
+                               float[] obs,
+                               float[] mask) throws Exception {
+        try (NDManager tickManager = manager.newSubManager()) {
+            NDList input = new NDList(
+                    TensorUtil.toNDArray(tickManager, obs, 1, obs.length),
+                    TensorUtil.toNDArray(tickManager, mask, 1, mask.length)
+            );
+
+            NDList output = predictor.predict(input);
+
+            // Output: [probs(7), value(1)]
+            return TensorUtil.toFloatArray(output.get(0));
+        }
     }
 
     /**
@@ -174,6 +213,53 @@ public class ModelManager implements AutoCloseable {
         } catch (IOException e) {
             logger.warning("Failed to list models in " + modelsDir + ": " + e.getMessage());
             return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Create a fresh random model by copying the bundled template.
+     *
+     * @param name the model name (without .pt extension)
+     * @throws IOException if the template can't be found or copied
+     */
+    public void createFreshModel(String name) throws IOException {
+        Path target = modelsDir.resolve(name + ".pt");
+        if (Files.exists(target)) {
+            throw new IOException("Model '" + name + "' already exists");
+        }
+
+        // Copy template from plugin resources
+        try (var in = getClass().getResourceAsStream("/models/__template.pt")) {
+            if (in == null) {
+                throw new IOException("Template model not bundled in plugin jar");
+            }
+            Files.copy(in, target);
+        }
+        logger.info("Created fresh model: " + name + " at " + target);
+    }
+
+    /**
+     * Remove a model by name: unload from memory and delete the .pt file.
+     *
+     * @param name the model name (without .pt extension)
+     * @return true if a model was found and removed
+     */
+    public boolean removeModel(String name) {
+        ZooModel<NDList, NDList> model = loadedModels.remove(name);
+        if (model != null) {
+            model.close();
+        }
+
+        Path modelPath = modelsDir.resolve(name + ".pt");
+        try {
+            boolean deleted = Files.deleteIfExists(modelPath);
+            if (deleted) {
+                logger.info("Removed model: " + name);
+            }
+            return deleted || model != null;
+        } catch (IOException e) {
+            logger.warning("Failed to delete model file: " + e.getMessage());
+            return model != null;
         }
     }
 

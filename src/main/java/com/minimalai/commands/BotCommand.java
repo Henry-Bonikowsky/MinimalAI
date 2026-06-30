@@ -2,33 +2,30 @@ package com.minimalai.commands;
 
 import com.minimalai.ai.*;
 import com.minimalai.bot.BotBrain;
+import com.minimalai.bot.BotBrain.BrainMode;
 import com.minimalai.bot.FakePlayerManager;
 import com.minimalai.bot.FakePlayerManager.BotContext;
 import com.minimalai.bot.KitManager;
 import com.minimalai.integration.ArcaneSigilsAPI;
+import com.minimalai.training.EpisodeManager;
 import com.minimalai.training.ExperienceBuffer;
 import com.minimalai.training.RewardComputer;
-import org.bukkit.ChatColor;
 import org.bukkit.Location;
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandExecutor;
-import org.bukkit.command.CommandSender;
-import org.bukkit.command.TabCompleter;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
+import java.util.logging.Logger;
 
 /**
- * Command executor for {@code /bot spawn|despawn|list}.
- * Manages BotBrain lifecycle alongside FakePlayerManager.
+ * Internal service managing BotBrain lifecycle, ticking, and spawning.
+ * Command handling is done by {@link MaiCommand}.
  */
-public class BotCommand implements CommandExecutor, TabCompleter {
+public class BotCommand {
 
-    private static final String PREFIX = ChatColor.GRAY + "[" + ChatColor.AQUA + "MinimalAI" + ChatColor.GRAY + "] " + ChatColor.RESET;
-    private static final List<String> SUB_COMMANDS = Arrays.asList("spawn", "despawn", "list", "savekit", "deletekit", "kits");
+    private static final Logger LOG = Logger.getLogger("MinimalAI");
 
     private final FakePlayerManager botManager;
     private final ModelManager modelManager;
@@ -37,10 +34,18 @@ public class BotCommand implements CommandExecutor, TabCompleter {
     private final @Nullable ArcaneSigilsAPI sigilsApi;
     private final @Nullable ExperienceBuffer experienceBuffer;
     private final @Nullable RewardComputer rewardComputer;
+    private final @Nullable EpisodeManager episodeManager;
     private final KitManager kitManager;
+    private final List<String> defaultSigils;
+    private final double defaultAttackReach;
 
-    // BotBrain instances managed here, ticked by MinimalAIPlugin
+    // Config-driven defaults
+    private BrainMode defaultMode = BrainMode.NEURAL;
+    private int defaultDifficulty = 3;
+    private @Nullable String sigilModelName = null;
+
     private final Map<String, BotBrain> brains = new ConcurrentHashMap<>();
+    private @Nullable MaiCommand maiCommand;
 
     public BotCommand(FakePlayerManager botManager,
                       ModelManager modelManager,
@@ -49,7 +54,10 @@ public class BotCommand implements CommandExecutor, TabCompleter {
                       @Nullable ArcaneSigilsAPI sigilsApi,
                       @Nullable ExperienceBuffer experienceBuffer,
                       @Nullable RewardComputer rewardComputer,
-                      KitManager kitManager) {
+                      @Nullable EpisodeManager episodeManager,
+                      KitManager kitManager,
+                      List<String> defaultSigils,
+                      double defaultAttackReach) {
         this.botManager = botManager;
         this.modelManager = modelManager;
         this.obsBuilder = obsBuilder;
@@ -57,201 +65,238 @@ public class BotCommand implements CommandExecutor, TabCompleter {
         this.sigilsApi = sigilsApi;
         this.experienceBuffer = experienceBuffer;
         this.rewardComputer = rewardComputer;
+        this.episodeManager = episodeManager;
         this.kitManager = kitManager;
+        this.defaultSigils = defaultSigils != null ? defaultSigils : Collections.emptyList();
+        this.defaultAttackReach = defaultAttackReach;
     }
 
-    @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (args.length == 0) {
-            sendUsage(sender);
-            return true;
-        }
-
-        switch (args[0].toLowerCase()) {
-            case "spawn" -> handleSpawn(sender, args);
-            case "despawn" -> handleDespawn(sender, args);
-            case "list" -> handleList(sender);
-            case "savekit" -> handleSaveKit(sender, args);
-            case "deletekit" -> handleDeleteKit(sender, args);
-            case "kits" -> handleListKits(sender);
-            default -> sendUsage(sender);
-        }
-        return true;
-    }
-
-    private void handleSpawn(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player)) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Only players can spawn bots.");
-            return;
-        }
-
-        // Check if any model is loaded
-        if (modelManager.listModels().isEmpty()) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "No models loaded. Place a .pt file in plugins/MinimalAI/models/ and run /maimodel load <name>");
-            return;
-        }
-
-        // Parse: /bot spawn [name] [kit:<kitname>]
-        String name = null;
-        String kitName = null;
-        for (int i = 1; i < args.length; i++) {
-            if (args[i].toLowerCase().startsWith("kit:")) {
-                kitName = args[i].substring(4);
-            } else if (name == null) {
-                name = args[i];
-            }
-        }
-
-        Location loc = player.getLocation();
-
-        BotContext ctx = botManager.spawn(player.getWorld(), loc, name);
-        if (ctx == null) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to spawn bot. Check console.");
-            return;
-        }
-
-        // Apply kit if specified
-        if (kitName != null) {
-            if (kitManager.applyKit(ctx.serverPlayer(), kitName)) {
-                sender.sendMessage(PREFIX + ChatColor.GREEN + "Applied kit '" + kitName + "'.");
-            } else {
-                sender.sendMessage(PREFIX + ChatColor.YELLOW + "Kit '" + kitName + "' not found. Bot spawned without gear.");
-            }
-        }
-
-        // Create BotBrain
+    public void setDefaultMode(String mode) {
         try {
-            String modelName = modelManager.listModels().get(0); // use first loaded model
-            BotBrain brain = new BotBrain(ctx.name(), ctx.serverPlayer(), modelManager, modelName,
-                    obsBuilder, actionExecutor, sigilsApi);
+            this.defaultMode = BrainMode.valueOf(mode.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            LOG.warning("Unknown bot mode '" + mode + "', defaulting to NEURAL");
+            this.defaultMode = BrainMode.NEURAL;
+        }
+    }
+
+    public void setDefaultDifficulty(int difficulty) {
+        this.defaultDifficulty = Math.max(1, Math.min(5, difficulty));
+    }
+
+    public void setSigilModelName(@Nullable String name) {
+        this.sigilModelName = name;
+    }
+
+    public void setMaiCommand(MaiCommand cmd) {
+        this.maiCommand = cmd;
+    }
+
+    // ----------------------------------------------------------------
+    //  Spawning
+    // ----------------------------------------------------------------
+
+    /**
+     * Spawn a bare bot with NO brain, NO kit, NO sigils - just the fake player.
+     * Use this for debugging to test if the fake player behaves like a regular entity.
+     */
+    public @Nullable BotContext spawnBare(World world, Location location, @Nullable String name) {
+        BotContext ctx = botManager.spawn(world, location, name);
+        if (ctx == null) return null;
+        LOG.info("Spawned bare bot '" + ctx.name() + "' with no brain/kit/sigils");
+        return ctx;
+    }
+
+    /**
+     * Spawn a bot with a brain. Returns the BotContext or null on failure.
+     * Handles: FakePlayer creation, BotBrain setup, kit application, training auto-enable.
+     *
+     * @param modelOrMode  model name, or "rule"/"hybrid" for rule-based modes
+     * @param kitName      kit name (nullable)
+     * @param difficulty   difficulty tier 1-5 (only for rule/hybrid, -1 = use default)
+     */
+    public @Nullable BotContext spawnBot(World world, Location location,
+                                         @Nullable String name,
+                                         @Nullable String modelOrMode,
+                                         @Nullable String kitName,
+                                         int difficulty) {
+        // Determine the brain mode
+        BrainMode mode = defaultMode;
+        String modelName = null;
+        int diff = difficulty > 0 ? difficulty : defaultDifficulty;
+
+        if (modelOrMode != null) {
+            switch (modelOrMode.toLowerCase()) {
+                case "rule" -> mode = BrainMode.RULE;
+                case "hybrid" -> mode = BrainMode.HYBRID;
+                default -> {
+                    mode = BrainMode.NEURAL;
+                    modelName = modelOrMode;
+                }
+            }
+        }
+
+        // NEURAL mode requires a model
+        if (mode == BrainMode.NEURAL && modelManager.listModels().isEmpty()) {
+            LOG.warning("No models available for NEURAL mode");
+            return null;
+        }
+
+        BotContext ctx = botManager.spawn(world, location, name);
+        if (ctx == null) return null;
+
+        // Phase 1 (tick+2): position reassert + sigil registration
+        final Location loc = location;
+        var plugin = org.bukkit.Bukkit.getPluginManager().getPlugin("MinimalAI");
+        org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            ctx.serverPlayer().snapTo(loc.getX(), loc.getY(), loc.getZ(), loc.getYaw(), loc.getPitch());
+
+            if (sigilsApi != null && sigilsApi.isAvailable()) {
+                List<String> sigils;
+                if (kitName != null) {
+                    sigils = kitManager.loadSigils(kitName);
+                } else {
+                    sigils = defaultSigils;
+                }
+                if (sigils != null && !sigils.isEmpty()) {
+                    sigilsApi.registerBotSigils(ctx.serverPlayer().getBukkitEntity(), sigils);
+                }
+            }
+        }, 2L);
+
+        // Phase 2 (tick+10): apply kit AFTER all plugins finish join processing
+        if (kitName != null) {
+            org.bukkit.Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                kitManager.applyKit(ctx.serverPlayer(), kitName);
+            }, 10L);
+        }
+
+        try {
+            BotBrain brain;
+
+            switch (mode) {
+                case RULE -> {
+                    RuleCombatEngine engine = new RuleCombatEngine(diff);
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), engine,
+                            null, null, obsBuilder, actionExecutor, sigilsApi);
+                    LOG.info("Spawning RULE bot '" + ctx.name() + "' difficulty=" + diff);
+                }
+                case HYBRID -> {
+                    RuleCombatEngine engine = new RuleCombatEngine(diff);
+                    // Try to load sigil model
+                    ModelManager sigilMgr = null;
+                    String sigilModel = this.sigilModelName;
+                    if (sigilModel != null && modelManager.listModels().contains(sigilModel)) {
+                        sigilMgr = modelManager;
+                    }
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), engine,
+                            sigilMgr, sigilModel, obsBuilder, actionExecutor, sigilsApi);
+                    LOG.info("Spawning HYBRID bot '" + ctx.name() + "' difficulty=" + diff
+                            + " sigilModel=" + (sigilModel != null ? sigilModel : "none"));
+                }
+                default -> { // NEURAL
+                    String model = modelName != null ? modelName : modelManager.listModels().get(0);
+                    brain = new BotBrain(ctx.name(), ctx.serverPlayer(), modelManager, model,
+                            obsBuilder, actionExecutor, sigilsApi);
+                    brain.setAttackReach(defaultAttackReach);
+                    LOG.info("Spawning NEURAL bot '" + ctx.name() + "' model=" + model);
+                }
+            }
 
             if (experienceBuffer != null && rewardComputer != null) {
                 brain.setTrainingComponents(experienceBuffer, rewardComputer);
                 rewardComputer.registerBot(ctx.name());
             }
 
+            if (maiCommand != null && maiCommand.isTrainingEnabled()) {
+                brain.setTrainingEnabled(true);
+                if (episodeManager != null) {
+                    episodeManager.startEpisode(ctx.name());
+                }
+            }
+
+            // Wire death callback
+            final String botName = ctx.name();
+            brain.setOnDeath(() -> {
+                org.bukkit.Location deathLoc = ctx.serverPlayer().getBukkitEntity().getLocation();
+                int totalDeaths = brain.getDeaths();
+                org.bukkit.Bukkit.getScheduler().runTask(plugin, () -> {
+                    removeBrain(botName);
+                    botManager.despawn(botName);
+                    org.bukkit.Bukkit.getPluginManager().callEvent(
+                        new com.minimalai.bot.BotDeathEvent(botName, deathLoc, totalDeaths)
+                    );
+                });
+            });
+
+            brain.setSpawnAnchor(
+                ctx.serverPlayer().getX(),
+                ctx.serverPlayer().getY(),
+                ctx.serverPlayer().getZ(),
+                15.0
+            );
+
             brains.put(ctx.name(), brain);
-            sender.sendMessage(PREFIX + ChatColor.GREEN + "Spawned bot '" + ctx.name() + "' with model '" + modelName + "'.");
         } catch (Exception e) {
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Bot spawned but brain failed: " + e.getMessage());
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "Bot will be idle until a model is loaded.");
+            LOG.warning("Brain creation failed for " + ctx.name() + ": " + e.getMessage());
         }
+
+        return ctx;
     }
 
-    private void handleDespawn(CommandSender sender, String[] args) {
-        if (args.length < 2) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /bot despawn <name|*>");
-            return;
-        }
+    /**
+     * Backward-compatible spawn (defaults to config mode, no difficulty override).
+     */
+    public @Nullable BotContext spawnBot(World world, Location location,
+                                         @Nullable String name,
+                                         @Nullable String modelOrMode,
+                                         @Nullable String kitName) {
+        return spawnBot(world, location, name, modelOrMode, kitName, -1);
+    }
 
-        String target = args[1];
+    // ----------------------------------------------------------------
+    //  Brain management
+    // ----------------------------------------------------------------
 
-        if ("*".equals(target)) {
-            int count = botManager.botCount();
-            if (count == 0) {
-                sender.sendMessage(PREFIX + ChatColor.YELLOW + "No bots to remove.");
-                return;
+    public Map<String, BotBrain> getBrains() {
+        return Collections.unmodifiableMap(brains);
+    }
+
+    public void registerBrain(String name, BotBrain brain) {
+        brains.put(name, brain);
+    }
+
+    public void removeBrain(String name) {
+        BotBrain brain = brains.remove(name);
+        if (brain != null) {
+            // Unregister virtual sigils
+            if (sigilsApi != null && sigilsApi.isAvailable()) {
+                Player bukkitPlayer = brain.getServerPlayer().getBukkitEntity();
+                sigilsApi.unregisterBotSigils(bukkitPlayer);
             }
-            for (BotBrain brain : brains.values()) {
-                if (rewardComputer != null) rewardComputer.unregisterBot(brain.getName());
-                brain.close();
-            }
-            brains.clear();
-            botManager.despawnAll();
-            sender.sendMessage(PREFIX + ChatColor.GREEN + "Removed all " + count + " bot(s).");
-        } else {
-            BotBrain brain = brains.remove(target);
-            if (brain != null) {
-                if (rewardComputer != null) rewardComputer.unregisterBot(target);
-                brain.close();
-            }
-            boolean removed = botManager.despawn(target);
-            if (removed) {
-                sender.sendMessage(PREFIX + ChatColor.GREEN + "Removed bot '" + target + "'.");
-            } else {
-                sender.sendMessage(PREFIX + ChatColor.RED + "No bot named '" + target + "' found.");
-            }
+            if (rewardComputer != null) rewardComputer.unregisterBot(name);
+            brain.close();
         }
     }
 
-    private void handleList(CommandSender sender) {
-        Collection<BotContext> bots = botManager.getAllBots();
-        if (bots.isEmpty()) {
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "No active bots.");
-            return;
-        }
-
-        sender.sendMessage(PREFIX + ChatColor.GREEN + "Active bots (" + bots.size() + "):");
-        for (BotContext ctx : bots) {
-            Location loc = ctx.bukkitLocation();
-            boolean hasBrain = brains.containsKey(ctx.name());
-            sender.sendMessage(ChatColor.GRAY + " - " + ChatColor.WHITE + ctx.name()
-                    + (hasBrain ? ChatColor.GREEN + " [AI]" : ChatColor.RED + " [idle]")
-                    + ChatColor.GRAY + " at "
-                    + String.format("%.1f, %.1f, %.1f", loc.getX(), loc.getY(), loc.getZ())
-                    + " in " + (loc.getWorld() != null ? loc.getWorld().getName() : "?"));
-        }
-    }
-
-    private void handleSaveKit(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player)) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Only players can save kits.");
-            return;
-        }
-        if (args.length < 2) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /bot savekit <name>");
-            return;
-        }
-        String kitName = args[1].toLowerCase();
-        try {
-            kitManager.saveKit(player, kitName);
-            sender.sendMessage(PREFIX + ChatColor.GREEN + "Saved your inventory as kit '" + kitName + "'.");
-        } catch (Exception e) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Failed to save kit: " + e.getMessage());
-        }
-    }
-
-    private void handleDeleteKit(CommandSender sender, String[] args) {
-        if (args.length < 2) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Usage: /bot deletekit <name>");
-            return;
-        }
-        String kitName = args[1].toLowerCase();
-        if (kitManager.deleteKit(kitName)) {
-            sender.sendMessage(PREFIX + ChatColor.GREEN + "Deleted kit '" + kitName + "'.");
-        } else {
-            sender.sendMessage(PREFIX + ChatColor.RED + "Kit '" + kitName + "' not found.");
-        }
-    }
-
-    private void handleListKits(CommandSender sender) {
-        List<String> kits = kitManager.listKits();
-        if (kits.isEmpty()) {
-            sender.sendMessage(PREFIX + ChatColor.YELLOW + "No saved kits. Use /bot savekit <name> to save your inventory.");
-            return;
-        }
-        sender.sendMessage(PREFIX + ChatColor.GREEN + "Saved kits (" + kits.size() + "):");
-        for (String kit : kits) {
-            sender.sendMessage(ChatColor.GRAY + " - " + ChatColor.WHITE + kit);
-        }
-    }
-
-    private void sendUsage(CommandSender sender) {
-        sender.sendMessage(PREFIX + ChatColor.YELLOW + "Usage:");
-        sender.sendMessage(ChatColor.GRAY + "  /bot spawn [name] [kit:<kit>]" + ChatColor.WHITE + " - Spawn AI bot");
-        sender.sendMessage(ChatColor.GRAY + "  /bot despawn <name|*>" + ChatColor.WHITE + " - Remove bot(s)");
-        sender.sendMessage(ChatColor.GRAY + "  /bot list" + ChatColor.WHITE + " - List active bots");
-        sender.sendMessage(ChatColor.GRAY + "  /bot savekit <name>" + ChatColor.WHITE + " - Save your inventory as a kit");
-        sender.sendMessage(ChatColor.GRAY + "  /bot deletekit <name>" + ChatColor.WHITE + " - Delete a saved kit");
-        sender.sendMessage(ChatColor.GRAY + "  /bot kits" + ChatColor.WHITE + " - List saved kits");
-    }
+    // ----------------------------------------------------------------
+    //  Tick loop
+    // ----------------------------------------------------------------
 
     /** Called by MinimalAIPlugin tick loop. */
     public void tickAll() {
+        boolean training = maiCommand != null && maiCommand.isTrainingEnabled();
         for (BotBrain brain : brains.values()) {
             brain.tick();
+            if (training && episodeManager != null && episodeManager.isActive(brain.getName())) {
+                episodeManager.tick(brain.getName());
+            }
         }
     }
+
+    // ----------------------------------------------------------------
+    //  Cleanup
+    // ----------------------------------------------------------------
 
     /** Called by MinimalAIPlugin on disable. */
     public void closeAll() {
@@ -262,51 +307,11 @@ public class BotCommand implements CommandExecutor, TabCompleter {
         brains.clear();
     }
 
-    public Map<String, BotBrain> getBrains() {
-        return Collections.unmodifiableMap(brains);
-    }
+    // ----------------------------------------------------------------
+    //  Getters
+    // ----------------------------------------------------------------
 
-    @Override
-    public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-        if (args.length == 1) {
-            return filterStartsWith(SUB_COMMANDS, args[0]);
-        }
-        String sub = args[0].toLowerCase();
-        if (args.length == 2) {
-            if ("despawn".equals(sub)) {
-                List<String> names = botManager.getAllBots().stream()
-                        .map(BotContext::name)
-                        .collect(Collectors.toList());
-                names.add("*");
-                return filterStartsWith(names, args[1]);
-            }
-            if ("deletekit".equals(sub)) {
-                return filterStartsWith(kitManager.listKits(), args[1]);
-            }
-        }
-        // For spawn, suggest kit: prefix after name
-        if ("spawn".equals(sub) && args.length >= 2) {
-            String last = args[args.length - 1];
-            if (last.toLowerCase().startsWith("kit:")) {
-                String kitPrefix = last.substring(4);
-                return kitManager.listKits().stream()
-                        .filter(k -> k.toLowerCase().startsWith(kitPrefix.toLowerCase()))
-                        .map(k -> "kit:" + k)
-                        .collect(Collectors.toList());
-            }
-            if (args.length == 3) {
-                return filterStartsWith(
-                        kitManager.listKits().stream().map(k -> "kit:" + k).collect(Collectors.toList()),
-                        last);
-            }
-        }
-        return List.of();
-    }
-
-    private static List<String> filterStartsWith(List<String> options, String prefix) {
-        String lower = prefix.toLowerCase();
-        return options.stream()
-                .filter(s -> s.toLowerCase().startsWith(lower))
-                .collect(Collectors.toCollection(ArrayList::new));
-    }
+    public FakePlayerManager getBotManager() { return botManager; }
+    public ModelManager getModelManager() { return modelManager; }
+    public KitManager getKitManager() { return kitManager; }
 }

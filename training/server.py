@@ -245,7 +245,9 @@ class TrainingServer:
     def deserialize_experiences(self, data: bytes) -> list:
         """Parse binary experience data from Java.
 
-        Format per experience (big-endian):
+        Wire format (big-endian):
+            int32      numExperiences   (4-byte header)
+            -- per experience --
             float[38]  selfState
             float[192] entityFeatures  (8 * 24 flattened)
             float[8]   entityMask
@@ -262,22 +264,24 @@ class TrainingServer:
         Returns:
             List of dicts, each with numpy arrays for the experience fields.
         """
-        if len(data) < EXPERIENCE_SIZE:
-            logging.warning(
-                f"Experience data too short: {len(data)} bytes "
-                f"(expected at least {EXPERIENCE_SIZE})"
-            )
+        if len(data) < 4:
+            logging.warning(f"Experience data too short: {len(data)} bytes (need at least 4 for header)")
             return []
 
-        num_experiences = len(data) // EXPERIENCE_SIZE
-        if len(data) % EXPERIENCE_SIZE != 0:
+        # Read numExperiences header (written by ExperienceBuffer.toSerializable())
+        num_experiences = struct.unpack_from(">i", data, 0)[0]
+        offset = 4
+
+        expected_size = 4 + num_experiences * EXPERIENCE_SIZE
+        if len(data) < expected_size:
             logging.warning(
-                f"Experience data length {len(data)} is not a multiple of "
-                f"experience size {EXPERIENCE_SIZE}; truncating"
+                f"Experience data too short: {len(data)} bytes "
+                f"(expected {expected_size} for {num_experiences} experiences)"
             )
+            # Clamp to what we can actually read
+            num_experiences = (len(data) - 4) // EXPERIENCE_SIZE
 
         experiences = []
-        offset = 0
 
         for _ in range(num_experiences):
             # self_state: float[38]
@@ -363,9 +367,17 @@ class TrainingServer:
                 + (1.0 - actions) * np.log(1.0 - probs_clamped)
             )
 
-            # Build action mask: all ones (Java should provide proper mask,
-            # but for now assume all actions valid from received data)
+            # Reconstruct action mask from actionProbs: Java masks invalid actions
+            # to prob 0 before sampling, so near-zero probs indicate masked actions.
+            # Swap weapon (13) and sigils (14-25) are always masked server-side.
             action_mask = np.ones(NUM_ACTIONS, dtype=np.float32)
+            action_mask[13] = 0.0  # ACT_SWAP_WEAPON always masked
+            for i in range(14, 26):  # sigil slots always masked
+                action_mask[i] = 0.0
+            # Additionally mask any action where prob was exactly 0 (item unavailable, etc.)
+            for i in range(NUM_ACTIONS):
+                if action_probs[i] < 1e-6:
+                    action_mask[i] = 0.0
 
             experiences.append({
                 "obs": {
